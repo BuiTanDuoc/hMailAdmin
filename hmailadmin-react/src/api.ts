@@ -16,7 +16,7 @@ async function http<T>(path: string, init: RequestInit = {}): Promise<T> {
     ...init,
     headers: { 'Content-Type': 'application/json', ...(auth.token ? { Authorization: `Bearer ${auth.token}` } : {}) },
   })
-  if (res.status === 401) { auth.set(null); location.assign('/login') }
+  if (res.status === 401 && auth.token && path !== '/auth/login') { auth.set(null); location.assign('/login') } // expired session only, not a failed login
   if (!res.ok) { const t = await res.text(); let m = t; try { m = JSON.parse(t).detail ?? t } catch { /* plain text */ } throw new Error(m || res.statusText) }
   return res.status === 204 ? (undefined as T) : res.json()
 }

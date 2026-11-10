@@ -42,27 +42,61 @@ api.AddEndpointFilter(async (ctx, next) =>
 {
     try { return await next(ctx); }
     catch (COMException e) { return HMail.Bad(e.Message); }
+    catch (UnauthorizedAccessException) { return Results.Unauthorized(); }
+    catch (Exception e)
+    {
+        ctx.HttpContext.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("api")
+            .LogError(e, "Request {Path} failed", ctx.HttpContext.Request.Path);
+        return Results.Problem(e.Message, statusCode: 500);   // admin-only API: the real reason helps debugging
+    }
 });
 
-app.MapPost("/api/auth/login", (LoginRequest req) =>
+app.MapPost("/api/auth/login", (LoginRequest req, ILogger<Program> log) =>
 {
-    dynamic hm = HMail.Connect();
+    dynamic hm = HMail.Raw();
     dynamic? acc = hm.Authenticate(req.Username, req.Password);   // null when credentials are wrong
-    if (acc is null || (int)acc.AdminLevel != 2) return Results.Unauthorized(); // 2 = server administrator
+    if (acc is null)
+    {
+        log.LogWarning("Login '{User}' refused: hMailServer rejected the credentials.", req.Username);
+        return Results.Unauthorized();
+    }
+    // The built-in Administrator signs in as server administrator by definition; mailbox accounts need AdminLevel 2.
+    bool builtIn = string.Equals(req.Username, "Administrator", StringComparison.OrdinalIgnoreCase);
+    int level = builtIn ? 2 : (int)acc.AdminLevel;
+    if (level != 2)
+    {
+        log.LogWarning("Login '{User}' refused: AdminLevel is {Level}, server administrator (2) required.", req.Username, level);
+        return Results.Unauthorized();
+    }
+    HMail.SetCredentials(req.Username, req.Password);
     var jwt = new JwtSecurityToken(
         claims: new[] { new Claim(ClaimTypes.Name, req.Username) },
         expires: DateTime.UtcNow.AddHours(8), signingCredentials: signing);
     return Results.Ok(new { token = new JwtSecurityTokenHandler().WriteToken(jwt) });
 }).RequireRateLimiting("login");
 
-api.MapGet("/stats", (SessionSampler sampler) =>
+api.MapGet("/stats", (SessionSampler sampler, ILogger<Program> log) =>
 {
     dynamic st = HMail.Connect().Status;
+    // Each counter is read on its own so one unsupported property cannot take the whole dashboard down.
+    int Num(string name, Func<object?> read)
+    {
+        try { return Convert.ToInt32(read()); }
+        catch (Exception e) { log.LogWarning("Status.{Name} unavailable: {Msg}", name, e.Message); return 0; }
+    }
+    int queue = 0;
+    try { queue = HMail.QueueRows().Count; }
+    catch (Exception e) { log.LogWarning("Queue count unavailable: {Msg}", e.Message); }
     return new
     {
         sessions = sampler.Snapshot(),
-        queue = HMail.QueueRows().Count,
-        messages = new { total = (int)st.ProcessedMessages, spam = (int)st.SpamMessages, virus = (int)st.VirusMessages },
+        queue,
+        messages = new
+        {
+            total = Num("ProcessedMessages", () => (object?)st.ProcessedMessages),
+            spam = Num("SpamMessages", () => (object?)st.SpamMessages),
+            virus = Num("VirusMessages", () => (object?)st.VirusMessages),
+        },
     };
 });
 
@@ -325,9 +359,26 @@ record SecurityInput(bool AutoBan, int MaxAttempts, int WithinMinutes, int BanMi
 static class HMail
 {
     // Late binding: no interop assembly needed. Requires the bridge to run on the hMailServer host.
-    public static dynamic Connect() =>
+    public static dynamic Raw() =>
         Activator.CreateInstance(Type.GetTypeFromProgID("hMailServer.Application")
             ?? throw new InvalidOperationException("hMailServer COM is not registered on this machine."))!;
+
+    // Every new COM Application object starts unauthenticated, so each call signs in again with the
+    // credentials of the last successful login. They are kept in memory only (never written to disk).
+    static (string User, string Pass)? _creds;
+    public static void SetCredentials(string user, string pass) => _creds = (user, pass);
+
+    public static dynamic Connect()
+    {
+        var c = _creds ?? throw new UnauthorizedAccessException("Chưa đăng nhập, hoặc bridge vừa khởi động lại.");
+        dynamic app = Raw();
+        if (app.Authenticate(c.User, c.Pass) is null)
+        {
+            _creds = null;
+            throw new UnauthorizedAccessException("hMailServer không còn chấp nhận thông tin đăng nhập đã lưu.");
+        }
+        return app;
+    }
 
     public static IResult Bad(string m) => Results.Problem(m, statusCode: 400);
     public static bool ValidEmail(string? s) => s is not null && System.Text.RegularExpressions.Regex.IsMatch(s, @"^[^@\s]+@[^@\s]+\.[^@\s]+$");
@@ -411,9 +462,10 @@ static class HMail
 }
 
 // Samples the number of open sessions every 30 s so the dashboard has a live line (last 24 samples).
-sealed class SessionSampler : BackgroundService
+sealed class SessionSampler(ILogger<SessionSampler> log) : BackgroundService
 {
     readonly Queue<int> _points = new();
+    bool _warned;
     public int[] Snapshot() { lock (_points) return _points.ToArray(); }
 
     protected override async Task ExecuteAsync(CancellationToken ct)
@@ -426,7 +478,11 @@ sealed class SessionSampler : BackgroundService
                 int n = (int)st.SessionCount(1) + (int)st.SessionCount(2) + (int)st.SessionCount(3); // SMTP, POP3, IMAP
                 lock (_points) { _points.Enqueue(n); while (_points.Count > 24) _points.Dequeue(); }
             }
-            catch { /* hMailServer stopped or COM unavailable: skip this sample */ }
+            catch (UnauthorizedAccessException) { /* nobody has logged in yet */ }
+            catch (Exception e)
+            {
+                if (!_warned) { _warned = true; log.LogWarning("Session sampling failed, chart stays empty: {Msg}", e.Message); }
+            }
             await Task.Delay(TimeSpan.FromSeconds(30), ct);
         }
     }

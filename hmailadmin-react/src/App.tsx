@@ -39,21 +39,45 @@ function Page({ title, children, error }: { title: string; children: ReactNode; 
 }
 
 function Table({ heads, rows, empty }: { heads: string[]; rows: ReactNode[][]; empty: string }) {
+  const [size, setSize] = useState(20)
+  const [page, setPage] = useState(0)
+  useEffect(() => setPage(0), [rows.length, size])
+  const pages = Math.max(1, Math.ceil(rows.length / size))
+  const cur = Math.min(page, pages - 1)
+  const from = cur * size
+  const btn = 'rounded-lg border border-line px-3 py-1.5 text-sm hover:bg-mist disabled:opacity-40 disabled:hover:bg-transparent'
   return (
-    <div className="overflow-x-auto rounded-xl border border-line bg-white">
-      <table className="w-full text-left text-sm">
-        <thead className="border-b border-line text-muted">
-          <tr>{heads.map(h => <th key={h} className="px-4 py-3 font-medium">{h}</th>)}</tr>
-        </thead>
-        <tbody>
-          {rows.length === 0 && <tr><td colSpan={heads.length} className="px-4 py-8 text-center text-muted">{empty}</td></tr>}
-          {rows.map((r, i) => (
-            <tr key={i} className="border-b border-line/60 last:border-0 hover:bg-mist/60">
-              {r.map((c, j) => <td key={j} className="px-4 py-3 align-middle">{c}</td>)}
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <div className="rounded-xl border border-line bg-white">
+      <div className="overflow-x-auto">
+        <table className="w-full text-left text-sm">
+          <thead className="border-b border-line text-muted">
+            <tr>{heads.map(h => <th key={h} className="px-4 py-3 font-medium">{h}</th>)}</tr>
+          </thead>
+          <tbody>
+            {rows.length === 0 && <tr><td colSpan={heads.length} className="px-4 py-8 text-center text-muted">{empty}</td></tr>}
+            {rows.slice(from, from + size).map((r, i) => (
+              <tr key={from + i} className="border-b border-line/60 last:border-0 hover:bg-mist/60">
+                {r.map((c, j) => <td key={j} className="px-4 py-3 align-middle">{c}</td>)}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {rows.length > 10 && (
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line px-4 py-3 text-sm text-muted">
+          <span>Hiển thị {from + 1}–{Math.min(from + size, rows.length)} / {rows.length}</span>
+          <div className="flex items-center gap-2">
+            <label className="flex items-center gap-2">Số dòng
+              <select value={size} onChange={e => setSize(Number(e.target.value))} className="rounded-lg border border-line bg-white px-2 py-1.5 text-ink">
+                {[10, 20, 50, 100].map(n => <option key={n} value={n}>{n}</option>)}
+              </select>
+            </label>
+            <button className={btn} disabled={cur === 0} onClick={() => setPage(cur - 1)}>Trước</button>
+            <span>Trang {cur + 1}/{pages}</span>
+            <button className={btn} disabled={cur >= pages - 1} onClick={() => setPage(cur + 1)}>Sau</button>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -64,6 +88,7 @@ function Search({ value, onChange, label }: { value: string; onChange: (v: strin
 }
 
 function Spark({ data }: { data: number[] }) {
+  if (data.length < 2) return <p className="py-4 text-sm text-muted">Đang thu thập dữ liệu…</p>
   const max = Math.max(...data, 1)
   const pts = data.map((v, i) => `${(i / (data.length - 1)) * 300},${60 - (v / max) * 54}`).join(' ')
   return <svg viewBox="0 0 300 64" className="h-16 w-full" role="img" aria-label="Phiên kết nối theo thời gian">
@@ -72,7 +97,8 @@ function Spark({ data }: { data: number[] }) {
 }
 
 function Dashboard() {
-  const { data, error } = useLoad<Stats>(api.stats)
+  const { data, error, reload } = useLoad<Stats>(api.stats)
+  useEffect(() => { const t = setInterval(reload, 15000); return () => clearInterval(t) }, [reload])
   return (
     <Page title="Tổng quan" error={error}>
       {!data ? <p className="text-muted">Đang tải…</p> : (
@@ -145,10 +171,11 @@ function FormDialog({ title, fields, initial, onSave, onClose }: {
   )
 }
 
-function Head({ q, setQ, label, onAdd, addLabel }: { q: string; setQ: (v: string) => void; label: string; onAdd: () => void; addLabel: string }) {
+function Head({ q, setQ, label, onAdd, addLabel, extra }: { q: string; setQ: (v: string) => void; label: string; onAdd: () => void; addLabel: string; extra?: ReactNode }) {
   return (
     <div className="mb-4 flex flex-wrap items-center gap-3">
       <input aria-label={label} placeholder={label} value={q} onChange={e => setQ(e.target.value)} className="w-full max-w-sm rounded-lg border border-line bg-white px-3 py-2 text-sm" />
+      {extra}
       <button onClick={onAdd} className="rounded-lg bg-ink px-4 py-2 text-sm font-medium text-white hover:bg-signal">{addLabel}</button>
     </div>
   )
@@ -190,12 +217,18 @@ function Domains() {
 
 function Accounts() {
   const { data, error, reload } = useLoad<Account[]>(api.accounts)
+  const { data: domains } = useLoad<Domain[]>(api.domains)
   const [q, setQ] = useState('')
+  const [dom, setDom] = useState('')
   const [dlg, setDlg] = useState<Account | 'new' | null>(null)
-  const rows = (data ?? []).filter(a => a.address.includes(q.toLowerCase()))
+  const rows = (data ?? []).filter(a => (!dom || a.address.toLowerCase().endsWith('@' + dom)) && a.address.includes(q.toLowerCase()))
   return (
     <Page title="Tài khoản" error={error}>
-      <Head q={q} setQ={setQ} label="Tìm tài khoản" addLabel="Thêm tài khoản" onAdd={() => setDlg('new')} />
+      <Head q={q} setQ={setQ} label="Tìm tài khoản" addLabel="Thêm tài khoản" onAdd={() => setDlg('new')}
+        extra={<select aria-label="Lọc theo tên miền" value={dom} onChange={e => setDom(e.target.value)} className="rounded-lg border border-line bg-white px-3 py-2 text-sm">
+          <option value="">Tất cả</option>
+          {(domains ?? []).map(d => <option key={d.id} value={d.name}>{d.name}</option>)}
+        </select>} />
       <Table heads={['Địa chỉ', 'Trạng thái', 'Đăng nhập gần nhất', 'Dung lượng', '']} empty="Không tìm thấy tài khoản."
         rows={rows.map(a => [<b key="n">{a.address}</b>, <Status key="s" active={a.active} />, a.lastLogon, <Quota key="q" used={a.usedMb} total={a.quotaMb} />,
           <Actions key="a" onEdit={() => setDlg(a)} onDelete={() => confirmDelete(`Xoá tài khoản ${a.address} và toàn bộ thư?`, () => crud.deleteAccount(a.id), reload)} />])} />

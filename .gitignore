@@ -57,3 +57,4 @@ TestResult.xml
 nunit-*.xml
 hmailadmin-react/node_modules/
 HMailBridge/.vs/
+hmailadmin-react/dist/
