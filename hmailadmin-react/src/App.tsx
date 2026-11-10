@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { NavLink, Navigate, Route, Routes, useNavigate } from 'react-router-dom'
-import { api, auth, type Account, type Domain, type QueueItem, type Stats } from './api'
+import { api, auth, crud, type Account, type Alias, type Domain, type QueueItem, type Stats } from './api'
 
 function useLoad<T>(fn: () => Promise<T>) {
   const [data, setData] = useState<T>()
@@ -13,6 +13,7 @@ function useLoad<T>(fn: () => Promise<T>) {
 const fmtMb = (mb: number) => (mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb} MB`)
 
 function Quota({ used, total }: { used: number; total: number }) {
+  if (total === 0) return <p className="text-xs text-muted">{fmtMb(used)} · không giới hạn</p>
   const pct = Math.min(100, Math.round((used / total) * 100))
   return (
     <div className="w-44">
@@ -94,28 +95,129 @@ function Dashboard() {
   )
 }
 
+type Field = { key: string; label: string; type?: 'text' | 'password' | 'number' | 'checkbox'; required?: boolean; readOnly?: boolean; hint?: string }
+type Values = Record<string, string | number | boolean>
+
+function FormDialog({ title, fields, initial, onSave, onClose }: {
+  title: string; fields: Field[]; initial: Values; onSave: (v: Values) => Promise<void>; onClose: () => void
+}) {
+  const [v, setV] = useState<Values>(initial)
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
+    addEventListener('keydown', h); return () => removeEventListener('keydown', h)
+  }, [onClose])
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault(); setBusy(true); setErr('')
+    try { await onSave(v); onClose() } catch (x) { setErr((x as Error).message); setBusy(false) }
+  }
+  const input = 'w-full rounded-lg border border-line px-3 py-2 text-sm read-only:bg-mist'
+  return (
+    <div role="dialog" aria-modal="true" aria-label={title} className="fixed inset-0 z-10 grid place-items-center bg-ink/50 p-4">
+      <form onSubmit={submit} className="w-full max-w-md space-y-4 rounded-2xl bg-white p-6">
+        <h2 className="text-lg font-semibold">{title}</h2>
+        {fields.map((f, i) => f.type === 'checkbox' ? (
+          <label key={f.key} className="flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={!!v[f.key]} onChange={e => setV({ ...v, [f.key]: e.target.checked })} />{f.label}
+          </label>
+        ) : (
+          <label key={f.key} className="block text-sm">
+            <span className="mb-1 block text-muted">{f.label}</span>
+            <input className={input} type={f.type ?? 'text'} required={f.required} readOnly={f.readOnly} autoFocus={i === 0 && !f.readOnly}
+              value={String(v[f.key] ?? '')} onChange={e => setV({ ...v, [f.key]: f.type === 'number' ? Number(e.target.value) : e.target.value })} />
+            {f.hint && <span className="mt-1 block text-xs text-muted">{f.hint}</span>}
+          </label>
+        ))}
+        {err && <p role="alert" className="text-sm text-warn">{err}</p>}
+        <div className="flex justify-end gap-2">
+          <button type="button" onClick={onClose} className="rounded-lg px-4 py-2 text-sm hover:bg-mist">Huỷ</button>
+          <button disabled={busy} className="rounded-lg bg-ink px-4 py-2 text-sm font-medium text-white hover:bg-signal disabled:opacity-50">Lưu thay đổi</button>
+        </div>
+      </form>
+    </div>
+  )
+}
+
+function Head({ q, setQ, label, onAdd, addLabel }: { q: string; setQ: (v: string) => void; label: string; onAdd: () => void; addLabel: string }) {
+  return (
+    <div className="mb-4 flex flex-wrap items-center gap-3">
+      <input aria-label={label} placeholder={label} value={q} onChange={e => setQ(e.target.value)} className="w-full max-w-sm rounded-lg border border-line bg-white px-3 py-2 text-sm" />
+      <button onClick={onAdd} className="rounded-lg bg-ink px-4 py-2 text-sm font-medium text-white hover:bg-signal">{addLabel}</button>
+    </div>
+  )
+}
+
+function Actions({ onEdit, onDelete }: { onEdit: () => void; onDelete: () => void }) {
+  return (
+    <div className="flex gap-3 text-sm font-medium">
+      <button onClick={onEdit} className="text-signal hover:underline">Sửa</button>
+      <button onClick={onDelete} className="text-warn hover:underline">Xoá</button>
+    </div>
+  )
+}
+
+async function confirmDelete(message: string, run: () => Promise<void>, reload: () => void) {
+  if (!confirm(message)) return
+  try { await run() } catch (e) { alert((e as Error).message) }
+  reload()
+}
+
 function Domains() {
-  const { data, error } = useLoad<Domain[]>(api.domains)
+  const { data, error, reload } = useLoad<Domain[]>(api.domains)
   const [q, setQ] = useState('')
+  const [dlg, setDlg] = useState<Domain | 'new' | null>(null)
   const rows = (data ?? []).filter(d => d.name.includes(q.toLowerCase()))
   return (
     <Page title="Tên miền" error={error}>
-      <Search value={q} onChange={setQ} label="Tìm tên miền" />
-      <Table heads={['Tên miền', 'Trạng thái', 'Tài khoản', 'Dung lượng']} empty="Chưa có tên miền nào."
-        rows={rows.map(d => [<b key="n">{d.name}</b>, <Status key="s" active={d.active} />, d.accounts, <Quota key="q" used={d.usedMb} total={d.quotaMb} />])} />
+      <Head q={q} setQ={setQ} label="Tìm tên miền" addLabel="Thêm tên miền" onAdd={() => setDlg('new')} />
+      <Table heads={['Tên miền', 'Trạng thái', 'Tài khoản', 'Dung lượng', '']} empty="Chưa có tên miền nào."
+        rows={rows.map(d => [<b key="n">{d.name}</b>, <Status key="s" active={d.active} />, d.accounts, <Quota key="q" used={d.usedMb} total={d.quotaMb} />,
+          <Actions key="a" onEdit={() => setDlg(d)} onDelete={() => confirmDelete(`Xoá tên miền ${d.name} cùng ${d.accounts} tài khoản của nó?`, () => crud.deleteDomain(d.id), reload)} />])} />
+      {dlg && <FormDialog title={dlg === 'new' ? 'Thêm tên miền' : `Sửa ${dlg.name}`} onClose={() => setDlg(null)}
+        fields={[{ key: 'name', label: 'Tên miền', required: true }, { key: 'quotaMb', label: 'Dung lượng tối đa (MB)', type: 'number', hint: '0 = không giới hạn' }, { key: 'active', label: 'Đang hoạt động', type: 'checkbox' }]}
+        initial={dlg === 'new' ? { name: '', quotaMb: 0, active: true } : { name: dlg.name, quotaMb: dlg.quotaMb, active: dlg.active }}
+        onSave={async v => { await crud.saveDomain(dlg === 'new' ? null : dlg.id, { name: String(v.name).trim().toLowerCase(), quotaMb: Number(v.quotaMb), active: !!v.active }); reload() }} />}
     </Page>
   )
 }
 
 function Accounts() {
-  const { data, error } = useLoad<Account[]>(api.accounts)
+  const { data, error, reload } = useLoad<Account[]>(api.accounts)
   const [q, setQ] = useState('')
+  const [dlg, setDlg] = useState<Account | 'new' | null>(null)
   const rows = (data ?? []).filter(a => a.address.includes(q.toLowerCase()))
   return (
     <Page title="Tài khoản" error={error}>
-      <Search value={q} onChange={setQ} label="Tìm tài khoản" />
-      <Table heads={['Địa chỉ', 'Trạng thái', 'Đăng nhập gần nhất', 'Dung lượng']} empty="Không tìm thấy tài khoản."
-        rows={rows.map(a => [<b key="n">{a.address}</b>, <Status key="s" active={a.active} />, a.lastLogon, <Quota key="q" used={a.usedMb} total={a.quotaMb} />])} />
+      <Head q={q} setQ={setQ} label="Tìm tài khoản" addLabel="Thêm tài khoản" onAdd={() => setDlg('new')} />
+      <Table heads={['Địa chỉ', 'Trạng thái', 'Đăng nhập gần nhất', 'Dung lượng', '']} empty="Không tìm thấy tài khoản."
+        rows={rows.map(a => [<b key="n">{a.address}</b>, <Status key="s" active={a.active} />, a.lastLogon, <Quota key="q" used={a.usedMb} total={a.quotaMb} />,
+          <Actions key="a" onEdit={() => setDlg(a)} onDelete={() => confirmDelete(`Xoá tài khoản ${a.address} và toàn bộ thư?`, () => crud.deleteAccount(a.id), reload)} />])} />
+      {dlg && <FormDialog title={dlg === 'new' ? 'Thêm tài khoản' : `Sửa ${dlg.address}`} onClose={() => setDlg(null)}
+        fields={[{ key: 'address', label: 'Địa chỉ email', required: true, readOnly: dlg !== 'new' },
+          { key: 'password', label: 'Mật khẩu', type: 'password', required: dlg === 'new', hint: dlg === 'new' ? 'Tối thiểu 8 ký tự' : 'Để trống nếu không đổi mật khẩu' },
+          { key: 'quotaMb', label: 'Dung lượng tối đa (MB)', type: 'number', hint: '0 = không giới hạn' }, { key: 'active', label: 'Đang hoạt động', type: 'checkbox' }]}
+        initial={dlg === 'new' ? { address: '', password: '', quotaMb: 1024, active: true } : { address: dlg.address, password: '', quotaMb: dlg.quotaMb, active: dlg.active }}
+        onSave={async v => { await crud.saveAccount(dlg === 'new' ? null : dlg.id, { address: String(v.address).trim().toLowerCase(), password: String(v.password) || undefined, quotaMb: Number(v.quotaMb), active: !!v.active }); reload() }} />}
+    </Page>
+  )
+}
+
+function Aliases() {
+  const { data, error, reload } = useLoad<Alias[]>(crud.aliases)
+  const [q, setQ] = useState('')
+  const [dlg, setDlg] = useState<Alias | 'new' | null>(null)
+  const rows = (data ?? []).filter(a => a.name.includes(q.toLowerCase()) || a.value.includes(q.toLowerCase()))
+  return (
+    <Page title="Alias" error={error}>
+      <Head q={q} setQ={setQ} label="Tìm alias" addLabel="Thêm alias" onAdd={() => setDlg('new')} />
+      <Table heads={['Alias', 'Chuyển tới', 'Trạng thái', '']} empty="Chưa có alias nào."
+        rows={rows.map(a => [<b key="n">{a.name}</b>, a.value, <Status key="s" active={a.active} />,
+          <Actions key="a" onEdit={() => setDlg(a)} onDelete={() => confirmDelete(`Xoá alias ${a.name}?`, () => crud.deleteAlias(a.id), reload)} />])} />
+      {dlg && <FormDialog title={dlg === 'new' ? 'Thêm alias' : `Sửa ${dlg.name}`} onClose={() => setDlg(null)}
+        fields={[{ key: 'name', label: 'Địa chỉ alias', required: true }, { key: 'value', label: 'Chuyển tới', required: true }, { key: 'active', label: 'Đang hoạt động', type: 'checkbox' }]}
+        initial={dlg === 'new' ? { name: '', value: '', active: true } : { name: dlg.name, value: dlg.value, active: dlg.active }}
+        onSave={async v => { await crud.saveAlias(dlg === 'new' ? null : dlg.id, { name: String(v.name).trim().toLowerCase(), value: String(v.value).trim().toLowerCase(), active: !!v.active }); reload() }} />}
     </Page>
   )
 }
@@ -157,7 +259,7 @@ function Login() {
   )
 }
 
-const nav = [['/', 'Tổng quan'], ['/domains', 'Tên miền'], ['/accounts', 'Tài khoản'], ['/queue', 'Hàng đợi gửi']]
+const nav = [['/', 'Tổng quan'], ['/domains', 'Tên miền'], ['/accounts', 'Tài khoản'], ['/aliases', 'Alias'], ['/queue', 'Hàng đợi gửi']]
 
 function Shell() {
   const go = useNavigate()
@@ -177,6 +279,7 @@ function Shell() {
           <Route index element={<Dashboard />} />
           <Route path="domains" element={<Domains />} />
           <Route path="accounts" element={<Accounts />} />
+          <Route path="aliases" element={<Aliases />} />
           <Route path="queue" element={<Queue />} />
         </Routes>
       </main>

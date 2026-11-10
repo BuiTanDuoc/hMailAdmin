@@ -1,7 +1,9 @@
 using System.IdentityModel.Tokens.Jwt;
+using System.Runtime.InteropServices;
 using System.Security.Claims;
 using System.Text;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.IdentityModel.Tokens;
 
 var b = WebApplication.CreateBuilder(args);
@@ -35,6 +37,12 @@ app.UseDefaultFiles();
 app.UseStaticFiles(); // put the Vite build (dist/*) into wwwroot to serve the SPA from the same origin
 
 var api = app.MapGroup("/api").RequireAuthorization();
+// COM refuses with its own sentence (bad password policy, duplicate name...): pass it on as a 400.
+api.AddEndpointFilter(async (ctx, next) =>
+{
+    try { return await next(ctx); }
+    catch (COMException e) { return HMail.Bad(e.Message); }
+});
 
 app.MapPost("/api/auth/login", (LoginRequest req) =>
 {
@@ -109,17 +117,144 @@ api.MapPost("/queue/retry", () =>
 // Check the COM reference for your version (APIs Reference) before enabling this.
 api.MapDelete("/queue/{id:int}", (int id) => Results.StatusCode(501));
 
+api.MapPost("/domains", (DomainInput i) =>
+{
+    if (!HMail.ValidDomain(i.Name)) return HMail.Bad("Tên miền không hợp lệ.");
+    dynamic d = HMail.Connect().Domains.Add();
+    d.Name = i.Name; d.Active = i.Active; d.MaxSize = i.QuotaMb; d.Save();
+    return Results.NoContent();
+});
+api.MapPut("/domains/{id:int}", (int id, DomainInput i) =>
+{
+    if (!HMail.ValidDomain(i.Name)) return HMail.Bad("Tên miền không hợp lệ.");
+    dynamic? d = HMail.Find(HMail.Connect().Domains, id);
+    if (d is null) return Results.NotFound();
+    d.Name = i.Name; d.Active = i.Active; d.MaxSize = i.QuotaMb; d.Save();
+    return Results.NoContent();
+});
+api.MapDelete("/domains/{id:int}", (int id) =>
+{
+    dynamic? d = HMail.Find(HMail.Connect().Domains, id);
+    if (d is null) return Results.NotFound();
+    d.Delete();
+    return Results.NoContent();
+});
+
+api.MapPost("/accounts", (AccountInput i) =>
+{
+    if (!HMail.ValidEmail(i.Address)) return HMail.Bad("Địa chỉ email không hợp lệ.");
+    if ((i.Password ?? "").Length < 8) return HMail.Bad("Mật khẩu tối thiểu 8 ký tự.");
+    dynamic? d = HMail.DomainOf(HMail.Connect(), i.Address);
+    if (d is null) return HMail.Bad("Tên miền của địa chỉ này chưa tồn tại.");
+    dynamic a = d.Accounts.Add();
+    a.Address = i.Address; a.Password = i.Password; a.Active = i.Active; a.MaxSize = i.QuotaMb; a.Save();
+    return Results.NoContent();
+});
+api.MapPut("/accounts/{id:int}", (int id, AccountInput i) =>
+{
+    dynamic? a = HMail.FindIn(HMail.Connect(), "Accounts", id);
+    if (a is null) return Results.NotFound();
+    if (!string.IsNullOrEmpty(i.Password))
+    {
+        if (i.Password.Length < 8) return HMail.Bad("Mật khẩu tối thiểu 8 ký tự.");
+        a.Password = i.Password;
+    }
+    a.Active = i.Active; a.MaxSize = i.QuotaMb; a.Save();   // the address is not changed here
+    return Results.NoContent();
+});
+api.MapDelete("/accounts/{id:int}", (int id) =>
+{
+    dynamic? a = HMail.FindIn(HMail.Connect(), "Accounts", id);
+    if (a is null) return Results.NotFound();
+    a.Delete();
+    return Results.NoContent();
+});
+
+api.MapGet("/aliases", () =>
+{
+    dynamic hm = HMail.Connect();
+    var list = new List<object>();
+    for (int i = 0; i < (int)hm.Domains.Count; i++)
+    {
+        dynamic aliases = hm.Domains.Item[i].Aliases;
+        for (int j = 0; j < (int)aliases.Count; j++)
+        {
+            dynamic a = aliases.Item[j];
+            list.Add(new { id = (int)a.ID, name = (string)a.Name, value = (string)a.Value, active = (bool)a.Active });
+        }
+    }
+    return list;
+});
+api.MapPost("/aliases", (AliasInput i) =>
+{
+    if (!HMail.ValidEmail(i.Name) || !HMail.ValidEmail(i.Value)) return HMail.Bad("Địa chỉ alias hoặc địa chỉ đích không hợp lệ.");
+    dynamic? d = HMail.DomainOf(HMail.Connect(), i.Name);
+    if (d is null) return HMail.Bad("Tên miền của alias chưa tồn tại.");
+    dynamic a = d.Aliases.Add();
+    a.Name = i.Name; a.Value = i.Value; a.Active = i.Active; a.Save();
+    return Results.NoContent();
+});
+api.MapPut("/aliases/{id:int}", (int id, AliasInput i) =>
+{
+    if (!HMail.ValidEmail(i.Name) || !HMail.ValidEmail(i.Value)) return HMail.Bad("Địa chỉ alias hoặc địa chỉ đích không hợp lệ.");
+    dynamic? a = HMail.FindIn(HMail.Connect(), "Aliases", id);
+    if (a is null) return Results.NotFound();
+    a.Name = i.Name; a.Value = i.Value; a.Active = i.Active; a.Save();
+    return Results.NoContent();
+});
+api.MapDelete("/aliases/{id:int}", (int id) =>
+{
+    dynamic? a = HMail.FindIn(HMail.Connect(), "Aliases", id);
+    if (a is null) return Results.NotFound();
+    a.Delete();
+    return Results.NoContent();
+});
+
 app.MapFallbackToFile("index.html");
 app.Run();
 
 record LoginRequest(string Username, string Password);
+record DomainInput(string Name, bool Active, int QuotaMb);
+record AccountInput(string Address, string? Password, bool Active, int QuotaMb);
+record AliasInput(string Name, string Value, bool Active);
 
 static class HMail
 {
     // Late binding: no interop assembly needed. Requires the bridge to run on the hMailServer host.
-    public static object Connect() =>
+    public static dynamic Connect() =>
         Activator.CreateInstance(Type.GetTypeFromProgID("hMailServer.Application")
             ?? throw new InvalidOperationException("hMailServer COM is not registered on this machine."))!;
+
+    public static IResult Bad(string m) => Results.Problem(m, statusCode: 400);
+    public static bool ValidEmail(string? s) => s is not null && System.Text.RegularExpressions.Regex.IsMatch(s, @"^[^@\s]+@[^@\s]+\.[^@\s]+$");
+    public static bool ValidDomain(string? s) => s is not null && System.Text.RegularExpressions.Regex.IsMatch(s, @"^[a-z0-9-]+(\.[a-z0-9-]+)+$");
+
+    // hMailServer collections are 0-based; items expose ID, Save() and Delete().
+    public static dynamic? Find(dynamic col, int id)
+    {
+        for (int i = 0; i < (int)col.Count; i++) { dynamic it = col.Item[i]; if ((int)it.ID == id) return it; }
+        return null;
+    }
+    public static dynamic? FindIn(dynamic hm, string child, int id)   // child = "Accounts" | "Aliases"
+    {
+        for (int i = 0; i < (int)hm.Domains.Count; i++)
+        {
+            dynamic d = hm.Domains.Item[i];
+            dynamic? hit = Find(child == "Accounts" ? d.Accounts : d.Aliases, id);
+            if (hit is not null) return hit;
+        }
+        return null;
+    }
+    public static dynamic? DomainOf(dynamic hm, string address)
+    {
+        string name = address[(address.IndexOf('@') + 1)..];
+        for (int i = 0; i < (int)hm.Domains.Count; i++)
+        {
+            dynamic d = hm.Domains.Item[i];
+            if (string.Equals((string)d.Name, name, StringComparison.OrdinalIgnoreCase)) return d;
+        }
+        return null;
+    }
 
     public static string FormatDate(object? v)
     {

@@ -17,7 +17,7 @@ async function http<T>(path: string, init: RequestInit = {}): Promise<T> {
     headers: { 'Content-Type': 'application/json', ...(auth.token ? { Authorization: `Bearer ${auth.token}` } : {}) },
   })
   if (res.status === 401) { auth.set(null); location.assign('/login') }
-  if (!res.ok) throw new Error((await res.text()) || res.statusText)
+  if (!res.ok) { const t = await res.text(); let m = t; try { m = JSON.parse(t).detail ?? t } catch { /* plain text */ } throw new Error(m || res.statusText) }
   return res.status === 204 ? (undefined as T) : res.json()
 }
 
@@ -52,4 +52,37 @@ export const api = {
     if (MOCK) { mock.queue = mock.queue.filter(q => q.id !== id); return wait(undefined) }
     return http<void>(`/queue/${id}`, { method: 'DELETE' })
   },
+}
+
+export type Alias = { id: number; name: string; value: string; active: boolean }
+export type DomainInput = { name: string; active: boolean; quotaMb: number }
+export type AccountInput = { address: string; password?: string; active: boolean; quotaMb: number }
+export type AliasInput = { name: string; value: string; active: boolean }
+
+let seq = 1000
+const aliasStore: Alias[] = [{ id: 1, name: 'info@adsun.vn', value: 'kiem@adsun.vn', active: true }]
+const run = (f: () => void) => { f(); return wait(undefined) }
+const drop = (arr: { id: number }[], id: number) => { const i = arr.findIndex(x => x.id === id); if (i >= 0) arr.splice(i, 1) }
+const send = (path: string, id: number | null, body: unknown) =>
+  http<void>(id === null ? path : `${path}/${id}`, { method: id === null ? 'POST' : 'PUT', body: JSON.stringify(body) })
+const remove = (path: string, id: number) => http<void>(`${path}/${id}`, { method: 'DELETE' })
+
+export const crud = {
+  saveDomain: (id: number | null, v: DomainInput) => MOCK ? run(() => {
+    if (id === null) mock.domains.push({ id: ++seq, accounts: 0, usedMb: 0, ...v })
+    else Object.assign(mock.domains.find(d => d.id === id)!, v)
+  }) : send('/domains', id, v),
+  deleteDomain: (id: number) => MOCK ? run(() => drop(mock.domains, id)) : remove('/domains', id),
+  saveAccount: (id: number | null, v: AccountInput) => MOCK ? run(() => {
+    const { password: _p, ...rest } = v
+    if (id === null) mock.accounts.push({ id: ++seq, usedMb: 0, lastLogon: '-', ...rest })
+    else Object.assign(mock.accounts.find(a => a.id === id)!, rest)
+  }) : send('/accounts', id, v),
+  deleteAccount: (id: number) => MOCK ? run(() => drop(mock.accounts, id)) : remove('/accounts', id),
+  aliases: () => (MOCK ? wait(aliasStore) : http<Alias[]>('/aliases')),
+  saveAlias: (id: number | null, v: AliasInput) => MOCK ? run(() => {
+    if (id === null) aliasStore.push({ id: ++seq, ...v })
+    else Object.assign(aliasStore.find(a => a.id === id)!, v)
+  }) : send('/aliases', id, v),
+  deleteAlias: (id: number) => MOCK ? run(() => drop(aliasStore, id)) : remove('/aliases', id),
 }
