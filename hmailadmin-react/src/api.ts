@@ -114,3 +114,27 @@ export const ext = {
   security: () => (MOCK ? wait(secStore) : http<SecuritySettings>('/settings/security')),
   saveSecurity: (v: SecuritySettings) => MOCK ? run(() => { secStore = v }) : http<void>('/settings/security', { method: 'PUT', body: JSON.stringify(v) }),
 }
+
+export type LogFile = { name: string; size: number; modified: string }
+export type LogSummary = {
+  lines: number; deliveries: number; failedTotal: number; errorsTotal: number; byType: Record<string, number>
+  failedLogins: { ip: string; protocol: string; count: number; last: string }[]
+  topIps: { ip: string; count: number }[]
+  errors: { code: string; severity: string; count: number; sample: string }[]
+  errorIps: { ip: string; count: number }[]
+}
+export type LogLine = { type: string; time: string; ip: string | null; message: string }
+export type LogQuery = { q: string; type: string; ip: string }
+const qs = (o: Record<string, string>) => new URLSearchParams(Object.entries(o).filter(([, v]) => v)).toString()
+
+export const logsApi = {
+  files: () => MOCK ? wait<LogFile[]>([{ name: 'hmailserver_2026-11-10.log', size: 3377583, modified: '2026-11-10 10:49' }]) : http<LogFile[]>('/logs'),
+  summary: (name: string) => MOCK ? wait<LogSummary>({
+    lines: 33289, deliveries: 412, failedTotal: 444, errorsTotal: 3, byType: { SMTPD: 7455, POP3D: 2144, IMAPD: 1663, SMTPC: 5300, DEBUG: 14077, ERROR: 3 },
+    failedLogins: [{ ip: '102.220.161.248', protocol: 'SMTPD', count: 200, last: '2026-11-10 09:58:12.331' }, { ip: '47.109.30.124', protocol: 'POP3D', count: 31, last: '2026-11-10 07:12:44.020' }],
+    topIps: [{ ip: '210.211.108.85', count: 3208 }], errors: [{ code: 'HM5136', severity: 'Medium', count: 1, sample: 'An error occured while parsing data…' }], errorIps: [{ ip: '14.241.226.233', count: 1 }],
+  }) : http<LogSummary>(`/logs/${name}/summary`),
+  search: (name: string, f: LogQuery) => MOCK ? wait<LogLine[]>([
+    { type: 'POP3D', time: '2026-11-10 00:03:08.087', ip: '118.193.45.77', message: 'SENT: -ERR Invalid user name or password.' },
+  ]) : http<LogLine[]>(`/logs/${name}/search?${qs(f)}`),
+}

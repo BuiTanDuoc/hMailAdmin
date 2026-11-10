@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { NavLink, Navigate, Route, Routes, useNavigate } from 'react-router-dom'
-import { api, auth, crud, ext, type Account, type Alias, type DistList, type IpRange, type SecuritySettings, type Domain, type QueueItem, type Stats } from './api'
+import { api, auth, crud, ext, logsApi, type LogFile, type LogLine, type LogSummary, type Account, type Alias, type DistList, type IpRange, type SecuritySettings, type Domain, type QueueItem, type Stats } from './api'
 
 function useLoad<T>(fn: () => Promise<T>) {
   const [data, setData] = useState<T>()
@@ -342,6 +342,76 @@ function Security() {
   )
 }
 
+function Logs() {
+  const files = useLoad<LogFile[]>(logsApi.files)
+  const [file, setFile] = useState('')
+  const [sum, setSum] = useState<LogSummary>()
+  const [lines, setLines] = useState<LogLine[]>([])
+  const [f, setF] = useState({ q: '', type: '', ip: '' })
+  const [err, setErr] = useState('')
+  const search = (query = f) => logsApi.search(file, query).then(setLines).catch(e => setErr(e.message))
+  useEffect(() => { if (!file && files.data?.length) setFile(files.data[0].name) }, [files.data, file])
+  useEffect(() => {
+    if (!file) return
+    const empty = { q: '', type: '', ip: '' }
+    setSum(undefined); setErr(''); setF(empty)
+    logsApi.summary(file).then(setSum).catch(e => setErr(e.message))
+    logsApi.search(file, empty).then(setLines).catch(e => setErr(e.message))
+  }, [file])
+  const look = (ip: string) => { const n = { q: '', type: '', ip }; setF(n); search(n) }
+  const block = async (ip: string) => {
+    if (!confirm(`Chặn ${ip}? Mọi kết nối SMTP/POP3/IMAP từ IP này sẽ bị từ chối. Đừng chặn IP của chính bạn.`)) return
+    try {
+      await ext.saveRange(null, { name: `Chặn ${ip}`, lowerIp: ip, upperIp: ip, priority: 90, allowSmtp: false, allowPop: false, allowImap: false })
+      alert(`Đã thêm IP range chặn ${ip}.`)
+    } catch (e) { alert((e as Error).message) }
+  }
+  const field = 'rounded-lg border border-line bg-white px-3 py-2 text-sm'
+  return (
+    <Page title="Nhật ký" error={files.error || err}>
+      <select aria-label="Chọn file log" value={file} onChange={e => setFile(e.target.value)} className={`mb-6 ${field}`}>
+        {(files.data ?? []).map(x => <option key={x.name} value={x.name}>{x.name} ({(x.size / 1048576).toFixed(1)} MB)</option>)}
+      </select>
+      {!sum ? <p className="text-muted">Đang phân tích…</p> : (
+        <div className="space-y-8">
+          <dl className="grid gap-4 sm:grid-cols-4">
+            {[['Tổng số dòng', sum.lines], ['Đăng nhập thất bại', sum.failedTotal], ['Lỗi', sum.errorsTotal], ['Lượt gửi thư', sum.deliveries]].map(([k, v]) => (
+              <div key={k} className="rounded-xl border border-line bg-white p-4">
+                <dt className="text-sm text-muted">{k}</dt><dd className="mt-1 text-2xl font-semibold">{Number(v).toLocaleString('vi-VN')}</dd>
+              </div>
+            ))}
+          </dl>
+          {sum.failedLogins.length > 0 && (
+            <div><h2 className="mb-3 font-semibold">Đăng nhập thất bại theo IP</h2>
+              <Table heads={['IP', 'Giao thức', 'Số lần', 'Lần cuối', '']} empty=""
+                rows={sum.failedLogins.map(x => [x.ip, x.protocol, x.count, x.last,
+                  <div key="a" className="flex gap-3 text-sm font-medium">
+                    <button onClick={() => look(x.ip)} className="text-signal hover:underline">Xem log</button>
+                    <button onClick={() => block(x.ip)} className="text-warn hover:underline">Chặn</button>
+                  </div>])} /></div>
+          )}
+          {sum.errors.length > 0 && (
+            <div><h2 className="mb-3 font-semibold">Lỗi ghi nhận</h2>
+              <Table heads={['Mã lỗi', 'Mức độ', 'Số lần', 'Ví dụ']} empty=""
+                rows={sum.errors.map(x => [<b key="c">{x.code}</b>, x.severity, x.count, <span key="s" className="break-all text-muted">{x.sample}</span>])} /></div>
+          )}
+          <div><h2 className="mb-3 font-semibold">Tìm trong log <span className="text-sm font-normal text-muted">(tối đa 200 dòng mới nhất)</span></h2>
+            <form onSubmit={e => { e.preventDefault(); search() }} className="mb-4 flex flex-wrap gap-3">
+              <input aria-label="Từ khoá" placeholder="Từ khoá" value={f.q} onChange={e => setF({ ...f, q: e.target.value })} className={field} />
+              <input aria-label="IP" placeholder="IP" value={f.ip} onChange={e => setF({ ...f, ip: e.target.value })} className={field} />
+              <select aria-label="Loại" value={f.type} onChange={e => setF({ ...f, type: e.target.value })} className={field}>
+                <option value="">Mọi loại</option>{Object.keys(sum.byType).map(t => <option key={t}>{t}</option>)}
+              </select>
+              <button className="rounded-lg bg-ink px-4 py-2 text-sm font-medium text-white hover:bg-signal">Tìm</button>
+            </form>
+            <Table heads={['Thời gian', 'Loại', 'IP', 'Nội dung']} empty="Không có dòng log phù hợp."
+              rows={lines.map(l => [l.time, l.type, l.ip ?? '—', <span key="m" className="break-all">{l.message}</span>])} /></div>
+        </div>
+      )}
+    </Page>
+  )
+}
+
 function Queue() {
   const { data, error, reload } = useLoad<QueueItem[]>(api.queue)
   const remove = async (id: number) => {
@@ -379,7 +449,7 @@ function Login() {
   )
 }
 
-const nav = [['/', 'Tổng quan'], ['/domains', 'Tên miền'], ['/accounts', 'Tài khoản'], ['/aliases', 'Alias'], ['/lists', 'Danh sách phân phối'], ['/ranges', 'IP ranges'], ['/security', 'Chống tấn công'], ['/queue', 'Hàng đợi gửi']]
+const nav = [['/', 'Tổng quan'], ['/domains', 'Tên miền'], ['/accounts', 'Tài khoản'], ['/aliases', 'Alias'], ['/lists', 'Danh sách phân phối'], ['/ranges', 'IP ranges'], ['/security', 'Chống tấn công'], ['/queue', 'Hàng đợi gửi'], ['/logs', 'Nhật ký']]
 
 function Shell() {
   const go = useNavigate()
@@ -404,6 +474,7 @@ function Shell() {
           <Route path="ranges" element={<Ranges />} />
           <Route path="security" element={<Security />} />
           <Route path="queue" element={<Queue />} />
+          <Route path="logs" element={<Logs />} />
         </Routes>
       </main>
     </div>

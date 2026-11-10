@@ -2,6 +2,7 @@ using System.IdentityModel.Tokens.Jwt;
 using System.Runtime.InteropServices;
 using System.Security.Claims;
 using System.Text;
+using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.IdentityModel.Tokens;
@@ -345,6 +346,74 @@ api.MapPut("/settings/security", (SecurityInput i) =>
     return Results.NoContent();
 });
 
+api.MapGet("/logs", (IConfiguration cfg) =>
+{
+    var dir = LogStore.Dir(cfg);
+    if (!Directory.Exists(dir)) return Results.Problem($"Không tìm thấy thư mục log: {dir}. Đặt Logs:Directory trong appsettings.json.", statusCode: 404);
+    return Results.Ok(new DirectoryInfo(dir).GetFiles("*.log").Where(f => LogStore.NameOk(f.Name))
+        .OrderByDescending(f => f.LastWriteTime)
+        .Select(f => new { name = f.Name, size = f.Length, modified = f.LastWriteTime.ToString("yyyy-MM-dd HH:mm") }));
+});
+
+api.MapGet("/logs/{name}/summary", (string name, IConfiguration cfg) =>
+{
+    if (!LogStore.NameOk(name)) return HMail.Bad("Tên file log không hợp lệ.");
+    var path = Path.Combine(LogStore.Dir(cfg), name);
+    if (!File.Exists(path)) return Results.NotFound();
+    int lines = 0, deliveries = 0;
+    var byType = new Dictionary<string, int>();
+    var ips = new Dictionary<string, int>();
+    var fails = new Dictionary<(string Proto, string Ip), (int Count, string Last)>();
+    var errs = new Dictionary<string, (string Sev, int Count, string Sample)>();
+    var errIps = new Dictionary<string, int>();
+    foreach (var l in LogStore.Read(path))
+    {
+        lines++;
+        byType[l.Type] = byType.GetValueOrDefault(l.Type) + 1;
+        if (l.Ip is not null) ips[l.Ip] = ips.GetValueOrDefault(l.Ip) + 1;
+        if (LogStore.IsFailedLogin(l)) { var k = (l.Type, l.Ip ?? ""); fails[k] = (fails.GetValueOrDefault(k).Count + 1, l.Time); }
+        if (l.Type == "APPLICATION" && l.Message.Contains("Delivering message from")) deliveries++;
+        if (l.Type == "ERROR")
+        {
+            var code = LogStore.CodeRx.Match(l.Message) is { Success: true } m ? m.Groups[1].Value : "?";
+            var sev = LogStore.SevRx.Match(l.Message) is { Success: true } sm ? sm.Groups[1].Value : "";
+            var cur = errs.GetValueOrDefault(code);
+            errs[code] = (sev, cur.Count + 1, cur.Sample ?? (l.Message.Length > 240 ? l.Message[..240] + "…" : l.Message));
+            if (LogStore.IpRx.Match(l.Message) is { Success: true } im) errIps[im.Groups[1].Value] = errIps.GetValueOrDefault(im.Groups[1].Value) + 1;
+        }
+    }
+    return Results.Ok(new
+    {
+        lines, deliveries, byType,
+        failedTotal = fails.Values.Sum(v => v.Count),
+        errorsTotal = errs.Values.Sum(v => v.Count),
+        failedLogins = fails.OrderByDescending(x => x.Value.Count).Take(20)
+            .Select(x => new { ip = x.Key.Ip, protocol = x.Key.Proto, count = x.Value.Count, last = x.Value.Last }),
+        topIps = ips.OrderByDescending(x => x.Value).Take(10).Select(x => new { ip = x.Key, count = x.Value }),
+        errors = errs.OrderByDescending(x => x.Value.Count).Take(20)
+            .Select(x => new { code = x.Key, severity = x.Value.Sev, count = x.Value.Count, sample = x.Value.Sample }),
+        errorIps = errIps.OrderByDescending(x => x.Value).Take(10).Select(x => new { ip = x.Key, count = x.Value }),
+    });
+});
+
+api.MapGet("/logs/{name}/search", (string name, string? q, string? type, string? ip, int? take, IConfiguration cfg) =>
+{
+    if (!LogStore.NameOk(name)) return HMail.Bad("Tên file log không hợp lệ.");
+    var path = Path.Combine(LogStore.Dir(cfg), name);
+    if (!File.Exists(path)) return Results.NotFound();
+    int max = Math.Clamp(take ?? 200, 1, 1000);
+    var buf = new Queue<LogLine>();   // keeps only the newest `max` matches
+    foreach (var l in LogStore.Read(path))
+    {
+        if (!string.IsNullOrEmpty(type) && !string.Equals(l.Type, type, StringComparison.OrdinalIgnoreCase)) continue;
+        if (!string.IsNullOrEmpty(ip) && l.Ip != ip && !l.Message.Contains(ip)) continue;
+        if (!string.IsNullOrEmpty(q) && !l.Message.Contains(q, StringComparison.OrdinalIgnoreCase)) continue;
+        buf.Enqueue(l);
+        if (buf.Count > max) buf.Dequeue();
+    }
+    return Results.Ok(buf.Reverse().Select(l => new { type = l.Type, time = l.Time, ip = l.Ip, message = l.Message.Length > 600 ? l.Message[..600] + "…" : l.Message }));
+});
+
 app.MapFallbackToFile("index.html");
 app.Run();
 
@@ -484,6 +553,45 @@ sealed class SessionSampler(ILogger<SessionSampler> log) : BackgroundService
                 if (!_warned) { _warned = true; log.LogWarning("Session sampling failed, chart stays empty: {Msg}", e.Message); }
             }
             await Task.Delay(TimeSpan.FromSeconds(30), ct);
+        }
+    }
+}
+
+record LogLine(string Type, string Time, string? Ip, string Message);
+
+// hMailServer log lines are tab-separated, every field in double quotes:
+//   "SMTPD"|"POP3D"|"IMAPD"|"SMTPC"  thread  session  time  ip  message
+//   "DEBUG"|"APPLICATION"|"TCPIP"|"ERROR"  thread  time  message
+static class LogStore
+{
+    public static string Dir(IConfiguration c) => c["Logs:Directory"] ?? @"C:\Program Files (x86)\hMailServer\Logs";
+
+    static readonly Regex NameRx = new(@"^(ERROR_)?hmailserver_\d{4}-\d{2}-\d{2}\.log$");
+    public static bool NameOk(string n) => NameRx.IsMatch(n);   // also blocks path traversal
+
+    public static readonly Regex CodeRx = new(@"Code: (HM\d+)");
+    public static readonly Regex SevRx = new(@"Severity: \d \((\w+)\)");
+    public static readonly Regex IpRx = new(@"Remote IP: ([0-9a-fA-F.:]+)");
+
+    public static bool IsFailedLogin(LogLine l) =>
+        l.Type is "SMTPD" or "POP3D" or "IMAPD" && l.Message.StartsWith("SENT:") &&
+        (l.Message.Contains("Invalid user name or password") || l.Message.Contains("Authentication failed"));
+
+    public static IEnumerable<LogLine> Read(string path)
+    {
+        // hMailServer keeps writing to today's file, so open it with shared access.
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var sr = new StreamReader(fs, Encoding.UTF8);
+        string? line;
+        while ((line = sr.ReadLine()) is not null)
+        {
+            var p = line.Split('\t');
+            if (p.Length < 4) continue;
+            for (int i = 0; i < p.Length; i++) p[i] = p[i].Trim('"');
+            if (p[0] is "SMTPD" or "POP3D" or "IMAPD" or "SMTPC" && p.Length >= 6)
+                yield return new LogLine(p[0], p[3], p[4], string.Join(' ', p.Skip(5)));
+            else
+                yield return new LogLine(p[0], p[2], null, string.Join(' ', p.Skip(3)));
         }
     }
 }
