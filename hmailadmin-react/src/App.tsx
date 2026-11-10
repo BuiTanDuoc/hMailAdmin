@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { NavLink, Navigate, Route, Routes, useNavigate } from 'react-router-dom'
-import { api, auth, crud, ext, logsApi, type LogFile, type LogLine, type LogSummary, type Account, type Alias, type DistList, type IpRange, type SecuritySettings, type Domain, type QueueItem, type Stats } from './api'
+import { api, auth, crud, ext, logsApi, tools, type Rule, type RuleInput, type RuleCriteria, type RuleAction, type SettingRow, type SettingValue, type BlResult, type LogFile, type LogLine, type LogSummary, type Account, type Alias, type DistList, type IpRange, type SecuritySettings, type Domain, type QueueItem, type Stats } from './api'
 
 function useLoad<T>(fn: () => Promise<T>) {
   const [data, setData] = useState<T>()
@@ -412,6 +412,214 @@ function Logs() {
   )
 }
 
+const FIELDS: [string, string][] = [['from', 'Người gửi (From)'], ['to', 'Người nhận (To)'], ['cc', 'CC'], ['subject', 'Tiêu đề'], ['body', 'Nội dung'],
+  ['size', 'Kích thước (byte)'], ['recipients', 'Người nhận envelope'], ['attempts', 'Lần gửi thứ'], ['header', 'Header tuỳ chỉnh']]
+const MATCHES: [string, string][] = [['equals', 'bằng'], ['contains', 'chứa'], ['notequals', 'không bằng'], ['notcontains', 'không chứa'],
+  ['lt', 'nhỏ hơn'], ['gt', 'lớn hơn'], ['wildcard', 'khớp wildcard'], ['regex', 'khớp regex']]
+const ACTS: [string, string][] = [['move', 'Chuyển vào thư mục IMAP'], ['forward', 'Chuyển tiếp tới'], ['setheader', 'Đặt giá trị header'],
+  ['copy', 'Tạo bản sao'], ['delete', 'Xoá thư'], ['stop', 'Dừng xử lý các rule sau']]
+const label = (list: [string, string][], k: string) => list.find(x => x[0] === k)?.[1] ?? k
+const blankCrit: RuleCriteria = { field: 'subject', header: '', match: 'contains', value: '' }
+const blankAct: RuleAction = { type: 'move', to: '', folder: '', header: '', value: '' }
+
+function RuleDialog({ title, initial, onSave, onClose }: { title: string; initial: RuleInput; onSave: (v: RuleInput) => Promise<void>; onClose: () => void }) {
+  const [v, setV] = useState(initial)
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
+    addEventListener('keydown', h); return () => removeEventListener('keydown', h)
+  }, [onClose])
+  const setC = (i: number, p: Partial<RuleCriteria>) => setV({ ...v, criteria: v.criteria.map((c, j) => (j === i ? { ...c, ...p } : c)) })
+  const setA = (i: number, p: Partial<RuleAction>) => setV({ ...v, actions: v.actions.map((a, j) => (j === i ? { ...a, ...p } : a)) })
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault(); setBusy(true); setErr('')
+    try { await onSave(v); onClose() } catch (x) { setErr((x as Error).message); setBusy(false) }
+  }
+  const f = 'rounded-lg border border-line bg-white px-2 py-2 text-sm'
+  const link = 'text-sm font-medium text-signal hover:underline'
+  return (
+    <div role="dialog" aria-modal="true" aria-label={title} className="fixed inset-0 z-10 overflow-y-auto bg-ink/50 p-4">
+      <form onSubmit={submit} className="mx-auto max-w-3xl space-y-5 rounded-2xl bg-white p-6">
+        <h2 className="text-lg font-semibold">{title}</h2>
+        <div className="flex flex-wrap items-center gap-3">
+          <input aria-label="Tên rule" required autoFocus placeholder="Tên rule" value={v.name} onChange={e => setV({ ...v, name: e.target.value })} className={`${f} min-w-60 flex-1`} />
+          <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={v.active} onChange={e => setV({ ...v, active: e.target.checked })} />Đang bật</label>
+          <select aria-label="Kiểu khớp" value={v.matchAll ? 'all' : 'any'} onChange={e => setV({ ...v, matchAll: e.target.value === 'all' })} className={f}>
+            <option value="all">Khớp TẤT CẢ điều kiện (AND)</option><option value="any">Khớp MỘT trong các điều kiện (OR)</option>
+          </select>
+        </div>
+        <section className="space-y-2"><h3 className="text-sm font-semibold text-muted">NẾU</h3>
+          {v.criteria.map((c, i) => (
+            <div key={i} className="flex flex-wrap gap-2">
+              <select aria-label="Trường" value={c.field} onChange={e => setC(i, { field: e.target.value })} className={f}>{FIELDS.map(([k, t]) => <option key={k} value={k}>{t}</option>)}</select>
+              {c.field === 'header' && <input aria-label="Tên header" placeholder="Tên header (không có dấu :)" value={c.header} onChange={e => setC(i, { header: e.target.value })} className={f} />}
+              <select aria-label="So khớp" value={c.match} onChange={e => setC(i, { match: e.target.value })} className={f}>{MATCHES.map(([k, t]) => <option key={k} value={k}>{t}</option>)}</select>
+              <input aria-label="Giá trị" placeholder="Giá trị" value={c.value} onChange={e => setC(i, { value: e.target.value })} className={`${f} min-w-40 flex-1`} />
+              <button type="button" aria-label="Xoá điều kiện" onClick={() => setV({ ...v, criteria: v.criteria.filter((_, j) => j !== i) })} className="px-2 text-warn">✕</button>
+            </div>
+          ))}
+          <button type="button" className={link} onClick={() => setV({ ...v, criteria: [...v.criteria, { ...blankCrit }] })}>+ Thêm điều kiện</button>
+        </section>
+        <section className="space-y-2"><h3 className="text-sm font-semibold text-muted">THÌ</h3>
+          {v.actions.map((a, i) => (
+            <div key={i} className="flex flex-wrap gap-2">
+              <select aria-label="Hành động" value={a.type} onChange={e => setA(i, { type: e.target.value })} className={f}>{ACTS.map(([k, t]) => <option key={k} value={k}>{t}</option>)}</select>
+              {a.type === 'move' && <input aria-label="Thư mục" placeholder="vd. INBOX.Junk" value={a.folder} onChange={e => setA(i, { folder: e.target.value })} className={`${f} min-w-40 flex-1`} />}
+              {a.type === 'forward' && <input aria-label="Địa chỉ" placeholder="địa chỉ email" value={a.to} onChange={e => setA(i, { to: e.target.value })} className={`${f} min-w-40 flex-1`} />}
+              {a.type === 'setheader' && <>
+                <input aria-label="Tên header" placeholder="Tên header" value={a.header} onChange={e => setA(i, { header: e.target.value })} className={f} />
+                <input aria-label="Giá trị header" placeholder="Giá trị" value={a.value} onChange={e => setA(i, { value: e.target.value })} className={`${f} min-w-40 flex-1`} /></>}
+              <button type="button" aria-label="Xoá hành động" onClick={() => setV({ ...v, actions: v.actions.filter((_, j) => j !== i) })} className="px-2 text-warn">✕</button>
+            </div>
+          ))}
+          <button type="button" className={link} onClick={() => setV({ ...v, actions: [...v.actions, { ...blankAct }] })}>+ Thêm hành động</button>
+        </section>
+        <ul className="list-disc space-y-1 pl-5 text-xs text-muted">
+          <li>Rule khớp không tự dừng: thêm hành động "Dừng xử lý các rule sau" nếu muốn kết thúc tại rule này.</li>
+          <li>"Không chứa" và "không bằng" đúng cả khi trường trống. Đừng dùng riêng chúng với hành động Xoá thư.</li>
+          <li>Kích thước tính bằng byte (25 MB = 26214400). Regex phải khớp toàn bộ giá trị và phân biệt hoa thường.</li>
+        </ul>
+        {err && <p role="alert" className="text-sm text-warn">{err}</p>}
+        <div className="flex justify-end gap-2">
+          <button type="button" onClick={onClose} className="rounded-lg px-4 py-2 text-sm hover:bg-mist">Huỷ</button>
+          <button disabled={busy} className="rounded-lg bg-ink px-4 py-2 text-sm font-medium text-white hover:bg-signal disabled:opacity-50">Lưu rule</button>
+        </div>
+      </form>
+    </div>
+  )
+}
+
+function Rules() {
+  const { data, error, reload } = useLoad<Rule[]>(tools.rules)
+  const [dlg, setDlg] = useState<Rule | 'new' | null>(null)
+  const move = async (id: number, dir: 'up' | 'down') => { try { await tools.moveRule(id, dir) } catch (e) { alert((e as Error).message) } reload() }
+  const toggle = async (r: Rule) => {
+    if (!r.supported) return
+    try { await tools.saveRule(r.id, { name: r.name, active: !r.active, matchAll: r.matchAll, criteria: r.criteria, actions: r.actions }) } catch (e) { alert((e as Error).message) }
+    reload()
+  }
+  const rows = data ?? []
+  return (
+    <Page title="Rules" error={error}>
+      <p className="mb-4 max-w-2xl text-sm text-muted">Rule toàn máy chủ, chạy từ trên xuống dưới cho mọi thư. Rule dùng hành động chưa hỗ trợ ở đây (trả lời, chạy script, route, bind IP) chỉ có thể xoá hoặc đổi thứ tự để tránh mất cấu hình.</p>
+      <div className="mb-4"><button onClick={() => setDlg('new')} className="rounded-lg bg-ink px-4 py-2 text-sm font-medium text-white hover:bg-signal">Thêm rule</button></div>
+      <Table heads={['#', 'Tên', 'Tóm tắt', 'Trạng thái', '']} empty="Chưa có rule nào."
+        rows={rows.map((r, i) => [i + 1, <b key="n">{r.name}</b>,
+          r.supported ? `${r.criteria.length} điều kiện → ${r.actions.map(a => label(ACTS, a.type)).join(', ')}` : <span key="u" className="text-warn">Có điều kiện hoặc hành động chưa hỗ trợ</span>,
+          <button key="s" onClick={() => toggle(r)} disabled={!r.supported} className="disabled:opacity-60"><Status active={r.active} /></button>,
+          <div key="a" className="flex gap-3 text-sm font-medium">
+            <button aria-label="Lên" onClick={() => move(r.id, 'up')} disabled={i === 0} className="text-muted disabled:opacity-30">↑</button>
+            <button aria-label="Xuống" onClick={() => move(r.id, 'down')} disabled={i === rows.length - 1} className="text-muted disabled:opacity-30">↓</button>
+            <button onClick={() => setDlg(r)} disabled={!r.supported} className="text-signal hover:underline disabled:opacity-40">Sửa</button>
+            <button onClick={() => confirmDelete(`Xoá rule "${r.name}"?`, () => tools.deleteRule(r.id), reload)} className="text-warn hover:underline">Xoá</button>
+          </div>])} />
+      {dlg && <RuleDialog title={dlg === 'new' ? 'Thêm rule' : `Sửa rule ${dlg.name}`} onClose={() => setDlg(null)}
+        initial={dlg === 'new' ? { name: '', active: true, matchAll: true, criteria: [{ ...blankCrit }], actions: [{ ...blankAct }] }
+          : { name: dlg.name, active: dlg.active, matchAll: dlg.matchAll, criteria: dlg.criteria, actions: dlg.actions }}
+        onSave={async v => { await tools.saveRule(dlg === 'new' ? null : dlg.id, v); reload() }} />}
+    </Page>
+  )
+}
+
+function Settings() {
+  const { data, error } = useLoad<SettingRow[]>(tools.settings)
+  const [vals, setVals] = useState<Record<string, SettingValue>>({})
+  const [errs, setErrs] = useState<Record<string, string>>({})
+  const [msg, setMsg] = useState('')
+  useEffect(() => {
+    if (!data) return
+    setVals(Object.fromEntries(data.filter(r => r.value !== null).map(r => [r.key, r.value as SettingValue])))
+    setErrs(Object.fromEntries(data.filter(r => r.error).map(r => [r.key, r.error as string])))
+  }, [data])
+  const save = async () => {
+    try {
+      const res = await tools.saveSettings(vals)
+      setErrs(res.errors)
+      setMsg(Object.keys(res.errors).length ? 'Một số mục không lưu được (xem thông báo đỏ).' : 'Đã lưu thay đổi.')
+    } catch (e) { setMsg((e as Error).message) }
+  }
+  const groups = [...new Set((data ?? []).map(r => r.group))]
+  const input = 'w-full max-w-sm rounded-lg border border-line px-3 py-2 text-sm'
+  return (
+    <Page title="Cài đặt" error={error}>
+      {!data ? <p className="text-muted">Đang tải…</p> : (
+        <div className="max-w-2xl space-y-6">
+          {groups.map(g => (
+            <div key={g} className="space-y-4 rounded-xl border border-line bg-white p-6">
+              <h2 className="font-semibold">{g}</h2>
+              {data.filter(r => r.group === g).map(r => (
+                <div key={r.key}>
+                  {r.type === 'bool' ? (
+                    <label className="flex items-center gap-2 text-sm"><input type="checkbox" disabled={r.value === null} checked={!!vals[r.key]} onChange={e => setVals({ ...vals, [r.key]: e.target.checked })} />{r.label}</label>
+                  ) : (
+                    <label className="block text-sm"><span className="mb-1 block text-muted">{r.label}</span>
+                      <input className={input} disabled={r.value === null} type={r.type === 'int' ? 'number' : 'text'} value={String(vals[r.key] ?? '')}
+                        onChange={e => setVals({ ...vals, [r.key]: r.type === 'int' ? Number(e.target.value) : e.target.value })} /></label>
+                  )}
+                  {errs[r.key] && <p role="alert" className="mt-1 text-xs text-warn">{r.key}: {errs[r.key]}</p>}
+                </div>
+              ))}
+            </div>
+          ))}
+          <div className="flex items-center gap-4">
+            <button onClick={save} className="rounded-lg bg-ink px-4 py-2 text-sm font-medium text-white hover:bg-signal">Lưu thay đổi</button>
+            {msg && <p role="status" className="text-sm text-muted">{msg}</p>}
+          </div>
+        </div>
+      )}
+    </Page>
+  )
+}
+
+function Utilities() {
+  const { data: srv, error, reload } = useLoad<{ state: number }>(tools.server)
+  const [ip, setIp] = useState('')
+  const [bl, setBl] = useState<BlResult[]>()
+  const [busy, setBusy] = useState('')
+  const run = async (key: string, f: () => Promise<unknown>, ok: string) => {
+    setBusy(key)
+    try { await f(); alert(ok) } catch (e) { alert((e as Error).message) }
+    setBusy(''); reload()
+  }
+  const states: Record<number, string> = { 0: 'Không rõ', 1: 'Đã dừng', 2: 'Đang khởi động', 3: 'Đang chạy', 4: 'Đang dừng' }
+  const card = 'space-y-3 rounded-xl border border-line bg-white p-6'
+  const btn = 'rounded-lg bg-ink px-4 py-2 text-sm font-medium text-white hover:bg-signal disabled:opacity-50'
+  const tone = { listed: 'text-warn', clean: 'text-signal', error: 'text-muted' }
+  const text = { listed: 'Bị liệt kê', clean: 'Sạch', error: 'Không kiểm tra được' }
+  return (
+    <Page title="Tiện ích" error={error}>
+      <div className="max-w-3xl space-y-6">
+        <div className={card}>
+          <h2 className="font-semibold">Dịch vụ hMailServer</h2>
+          <p className="text-sm text-muted">Trạng thái: <b className="text-ink">{srv ? (states[srv.state] ?? srv.state) : '…'}</b></p>
+          <div className="flex gap-3">
+            <button className={btn} disabled={!!busy} onClick={() => confirm('Dừng nhận và gửi thư?') && run('stop', () => tools.serverAction('stop'), 'Đã gửi lệnh dừng.')}>Dừng</button>
+            <button className={btn} disabled={!!busy} onClick={() => run('start', () => tools.serverAction('start'), 'Đã gửi lệnh khởi động.')}>Khởi động</button>
+          </div>
+        </div>
+        <div className={card}>
+          <h2 className="font-semibold">Sao lưu</h2>
+          <p className="text-sm text-muted">Chạy sao lưu theo cấu hình Backup hiện có trong hMailServer (thư mục đích, mục cần sao lưu).</p>
+          <button className={btn} disabled={!!busy} onClick={() => run('backup', tools.backup, 'Đã yêu cầu sao lưu.')}>Chạy sao lưu ngay</button>
+        </div>
+        <div className={card}>
+          <h2 className="font-semibold">Kiểm tra blacklist (DNSBL)</h2>
+          <form className="flex flex-wrap gap-3" onSubmit={async e => {
+            e.preventDefault(); setBusy('bl'); setBl(undefined)
+            try { setBl(await tools.blacklist(ip.trim())) } catch (x) { alert((x as Error).message) }
+            setBusy('')
+          }}>
+            <input aria-label="IPv4" required placeholder="IP công khai của máy chủ mail" value={ip} onChange={e => setIp(e.target.value)} className="w-64 rounded-lg border border-line px-3 py-2 text-sm" />
+            <button className={btn} disabled={busy === 'bl'}>{busy === 'bl' ? 'Đang kiểm tra…' : 'Kiểm tra'}</button>
+          </form>
+          {bl && <Table heads={['Danh sách', 'Kết quả', 'Chi tiết']} empty="" rows={bl.map(r => [r.zone, <b key="s" className={tone[r.status]}>{text[r.status]}</b>, <span key="d" className="break-all text-muted">{r.detail}</span>])} />}
+        </div>
+      </div>
+    </Page>
+  )
+}
+
 function Queue() {
   const { data, error, reload } = useLoad<QueueItem[]>(api.queue)
   const remove = async (id: number) => {
@@ -449,7 +657,7 @@ function Login() {
   )
 }
 
-const nav = [['/', 'Tổng quan'], ['/domains', 'Tên miền'], ['/accounts', 'Tài khoản'], ['/aliases', 'Alias'], ['/lists', 'Danh sách phân phối'], ['/ranges', 'IP ranges'], ['/security', 'Chống tấn công'], ['/queue', 'Hàng đợi gửi'], ['/logs', 'Nhật ký']]
+const nav = [['/', 'Tổng quan'], ['/domains', 'Tên miền'], ['/accounts', 'Tài khoản'], ['/aliases', 'Alias'], ['/lists', 'Danh sách phân phối'], ['/ranges', 'IP ranges'], ['/security', 'Chống tấn công'], ['/rules', 'Rules'], ['/queue', 'Hàng đợi gửi'], ['/logs', 'Nhật ký'], ['/settings', 'Cài đặt'], ['/utilities', 'Tiện ích']]
 
 function Shell() {
   const go = useNavigate()
@@ -475,6 +683,9 @@ function Shell() {
           <Route path="security" element={<Security />} />
           <Route path="queue" element={<Queue />} />
           <Route path="logs" element={<Logs />} />
+          <Route path="rules" element={<Rules />} />
+          <Route path="settings" element={<Settings />} />
+          <Route path="utilities" element={<Utilities />} />
         </Routes>
       </main>
     </div>

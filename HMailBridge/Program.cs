@@ -1,7 +1,11 @@
 using System.IdentityModel.Tokens.Jwt;
 using System.Runtime.InteropServices;
 using System.Security.Claims;
+using System.Net;
+using System.Net.Sockets;
+using System.Reflection;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.RateLimiting;
@@ -414,6 +418,114 @@ api.MapGet("/logs/{name}/search", (string name, string? q, string? type, string?
     return Results.Ok(buf.Reverse().Select(l => new { type = l.Type, time = l.Time, ip = l.Ip, message = l.Message.Length > 600 ? l.Message[..600] + "…" : l.Message }));
 });
 
+// ---------- Rules (server-wide) ----------
+api.MapGet("/rules", () =>
+{
+    dynamic rules = HMail.Connect().Rules;
+    var list = new List<RuleDto>();
+    for (int i = 0; i < (int)rules.Count; i++)
+    {
+        dynamic r = rules.Item[i];
+        bool supported = true;
+        var crit = new List<CritDto>();
+        for (int j = 0; j < (int)r.Criterias.Count; j++)
+        {
+            dynamic c = r.Criterias.Item[j];
+            bool predefined = (bool)c.UsePredefined;
+            string? field = predefined ? RuleMap.Name(RuleMap.Fields, (int)c.PredefinedField) : "header";
+            string? match = RuleMap.Name(RuleMap.Matches, (int)c.MatchType);
+            if (field is null || match is null) supported = false;
+            crit.Add(new CritDto(field ?? "?", predefined ? "" : (string)c.HeaderField, match ?? "?", (string)c.MatchValue));
+        }
+        var acts = new List<ActDto>();
+        for (int j = 0; j < (int)r.Actions.Count; j++)
+        {
+            dynamic a = r.Actions.Item[j];
+            string? type = RuleMap.Name(RuleMap.Actions, (int)a.Type);
+            if (type is null) { supported = false; acts.Add(new ActDto("?", "", "", "", "")); continue; }
+            acts.Add(new ActDto(type, type == "forward" ? (string)a.To : "", type == "move" ? (string)a.IMAPFolder : "",
+                                type == "setheader" ? (string)a.HeaderName : "", type == "setheader" ? (string)a.Value : ""));
+        }
+        list.Add(new RuleDto((int)r.ID, (string)r.Name, (bool)r.Active, (bool)r.UseAND, supported, crit, acts));
+    }
+    return list;
+});
+api.MapPost("/rules", (RuleInput i) =>
+{
+    if (RuleMap.Check(i) is { } err) return HMail.Bad(err);
+    RuleMap.Apply(HMail.Connect().Rules.Add(), i);
+    return Results.NoContent();
+});
+api.MapPut("/rules/{id:int}", (int id, RuleInput i) =>
+{
+    if (RuleMap.Check(i) is { } err) return HMail.Bad(err);
+    dynamic? r = HMail.Find(HMail.Connect().Rules, id);
+    if (r is null) return Results.NotFound();
+    RuleMap.Apply(r, i);   // criteria and actions are replaced as a whole
+    return Results.NoContent();
+});
+api.MapDelete("/rules/{id:int}", (int id) =>
+{
+    dynamic? r = HMail.Find(HMail.Connect().Rules, id);
+    if (r is null) return Results.NotFound();
+    r.Delete();
+    return Results.NoContent();
+});
+api.MapPost("/rules/{id:int}/move", (int id, string dir) =>
+{
+    dynamic? r = HMail.Find(HMail.Connect().Rules, id);
+    if (r is null) return Results.NotFound();
+    if (dir == "up") r.MoveUp(); else if (dir == "down") r.MoveDown(); else return HMail.Bad("dir phải là up hoặc down.");
+    return Results.NoContent();
+});
+
+// ---------- Settings (whitelist; each key reads/writes on its own) ----------
+api.MapGet("/settings", () =>
+{
+    object s = HMail.Connect().Settings;
+    var rows = new List<SettingRow>();
+    foreach (var d in SettingsMap.All)
+    {
+        try { var (h, p) = SettingsMap.Resolve(s, d.Key); rows.Add(new SettingRow(d.Group, d.Key, d.Label, d.Type, SettingsMap.Get(h, p), null)); }
+        catch (Exception e) { rows.Add(new SettingRow(d.Group, d.Key, d.Label, d.Type, null, SettingsMap.Short(e))); }
+    }
+    return rows;
+});
+api.MapPut("/settings", (Dictionary<string, JsonElement> values) =>
+{
+    object s = HMail.Connect().Settings;
+    var errors = new Dictionary<string, string>();
+    foreach (var d in SettingsMap.All)
+    {
+        if (!values.TryGetValue(d.Key, out var v)) continue;
+        try
+        {
+            var (h, p) = SettingsMap.Resolve(s, d.Key);
+            object val = d.Type switch { "bool" => v.GetBoolean(), "int" => v.GetInt32(), _ => v.GetString() ?? "" };
+            SettingsMap.Set(h, p, val);
+        }
+        catch (Exception e) { errors[d.Key] = SettingsMap.Short(e); }
+    }
+    return Results.Ok(new { errors });
+});
+
+// ---------- Utilities ----------
+api.MapGet("/utilities/server", () => new { state = (int)HMail.Connect().ServerState });   // 1 stopped, 2 starting, 3 running, 4 stopping
+api.MapPost("/utilities/server/{action}", (string action) =>
+{
+    dynamic hm = HMail.Connect();
+    if (action == "start") hm.Start(); else if (action == "stop") hm.Stop(); else return HMail.Bad("action phải là start hoặc stop.");
+    return Results.NoContent();
+});
+api.MapPost("/utilities/backup", () => { HMail.Connect().BackupManager.StartBackup(); return Results.NoContent(); });
+api.MapPost("/utilities/blacklist", async (BlacklistRequest req) =>
+{
+    if (!IPAddress.TryParse(req.Ip, out var ip) || ip.AddressFamily != AddressFamily.InterNetwork) return HMail.Bad("Chỉ hỗ trợ kiểm tra địa chỉ IPv4.");
+    var rev = string.Join('.', ip.GetAddressBytes().Reverse());
+    var results = await Task.WhenAll(Dnsbl.Zones.Select(z => Dnsbl.CheckAsync(rev, z)));
+    return Results.Ok(results);
+});
+
 app.MapFallbackToFile("index.html");
 app.Run();
 
@@ -593,5 +705,144 @@ static class LogStore
             else
                 yield return new LogLine(p[0], p[2], null, string.Join(' ', p.Skip(3)));
         }
+    }
+}
+
+record CritDto(string Field, string Header, string Match, string Value);
+record ActDto(string Type, string To, string Folder, string Header, string Value);
+record RuleDto(int Id, string Name, bool Active, bool MatchAll, bool Supported, List<CritDto> Criteria, List<ActDto> Actions);
+record RuleInput(string Name, bool Active, bool MatchAll, List<CritDto> Criteria, List<ActDto> Actions);
+record SettingDef(string Group, string Key, string Label, string Type);
+record SettingRow(string Group, string Key, string Label, string Type, object? Value, string? Error);
+record BlacklistRequest(string Ip);
+record BlResult(string Zone, string Status, string Detail);
+
+// Enumerations from hMailServer.idl: eRulePredefinedField, eRuleMatchType, eRuleActionType.
+static class RuleMap
+{
+    public static readonly Dictionary<string, int> Fields = new()
+        { ["from"] = 1, ["to"] = 2, ["cc"] = 3, ["subject"] = 4, ["body"] = 5, ["size"] = 6, ["recipients"] = 7, ["attempts"] = 8 };
+    public static readonly Dictionary<string, int> Matches = new()
+        { ["equals"] = 1, ["contains"] = 2, ["lt"] = 3, ["gt"] = 4, ["regex"] = 5, ["notcontains"] = 6, ["notequals"] = 7, ["wildcard"] = 8 };
+    // Only the actions this UI can edit. Reply (3), run script (5), send using route (8) and bind to address (10)
+    // are left alone: a rule that uses them is listed as read-only so a save cannot silently drop them.
+    public static readonly Dictionary<string, int> Actions = new()
+        { ["delete"] = 1, ["forward"] = 2, ["move"] = 4, ["stop"] = 6, ["setheader"] = 7, ["copy"] = 9 };
+
+    public static string? Name(Dictionary<string, int> map, int value) => map.Where(x => x.Value == value).Select(x => x.Key).FirstOrDefault();
+
+    public static string? Check(RuleInput i)
+    {
+        if (string.IsNullOrWhiteSpace(i.Name)) return "Tên rule không được để trống.";
+        if (i.Criteria.Count == 0) return "Rule cần ít nhất một điều kiện: rule không có điều kiện sẽ không chạy hành động nào.";
+        if (i.Actions.Count == 0) return "Rule cần ít nhất một hành động.";
+        foreach (var c in i.Criteria)
+        {
+            bool custom = c.Field == "header";
+            if (!custom && !Fields.ContainsKey(c.Field)) return "Trường điều kiện không hợp lệ.";
+            if (custom && string.IsNullOrWhiteSpace(c.Header)) return "Điều kiện header tuỳ chỉnh cần tên header.";
+            if (!Matches.ContainsKey(c.Match)) return "Kiểu so khớp không hợp lệ.";
+        }
+        foreach (var a in i.Actions)
+        {
+            if (!Actions.ContainsKey(a.Type)) return "Hành động không hợp lệ.";
+            if (a.Type == "forward" && !HMail.ValidEmail(a.To)) return "Địa chỉ chuyển tiếp không hợp lệ.";
+            if (a.Type == "move" && string.IsNullOrWhiteSpace(a.Folder)) return "Hãy nhập tên thư mục IMAP.";
+            if (a.Type == "setheader" && string.IsNullOrWhiteSpace(a.Header)) return "Hãy nhập tên header.";
+        }
+        return null;
+    }
+
+    public static void Apply(dynamic rule, RuleInput i)
+    {
+        rule.Name = i.Name; rule.Active = i.Active; rule.UseAND = i.MatchAll; rule.Save();   // saved first: children need its ID
+        for (int k = (int)rule.Criterias.Count - 1; k >= 0; k--) rule.Criterias.Item[k].Delete();
+        for (int k = (int)rule.Actions.Count - 1; k >= 0; k--) rule.Actions.Item[k].Delete();
+        foreach (var c in i.Criteria)
+        {
+            dynamic x = rule.Criterias.Add();
+            if (c.Field == "header") { x.UsePredefined = false; x.HeaderField = c.Header; }
+            else { x.UsePredefined = true; x.PredefinedField = Fields[c.Field]; }
+            x.MatchType = Matches[c.Match]; x.MatchValue = c.Value; x.Save();
+        }
+        foreach (var a in i.Actions)
+        {
+            dynamic x = rule.Actions.Add();
+            x.Type = Actions[a.Type];
+            if (a.Type == "forward") x.To = a.To;
+            if (a.Type == "move") x.IMAPFolder = a.Folder;
+            if (a.Type == "setheader") { x.HeaderName = a.Header; x.Value = a.Value; }
+            x.Save();
+        }
+    }
+}
+
+// Settings reached by property path from Application.Settings, read and written with late-bound InvokeMember.
+// HostName, MaxMessageSize and RuleLoopLimit are confirmed in the COM documentation; the rest follow the
+// hMailServer object model from memory, so a wrong name shows up as an error on that one row only.
+static class SettingsMap
+{
+    public static readonly SettingDef[] All =
+    {
+        new("Chung", "HostName", "Tên máy chủ (host name)", "string"),
+        new("Chung", "MaxMessageSize", "Kích thước thư tối đa (KB)", "int"),
+        new("Chung", "RuleLoopLimit", "Giới hạn vòng lặp rule", "int"),
+        new("SMTP", "WelcomeSMTP", "Lời chào SMTP", "string"),
+        new("SMTP", "SMTPNoOfTries", "Số lần thử gửi", "int"),
+        new("SMTP", "SMTPMinutesBetweenTry", "Phút giữa các lần thử", "int"),
+        new("SMTP", "MaxNumberOfMXHosts", "Số MX host tối đa", "int"),
+        new("SMTP", "MaxSMTPRecipientsInBatch", "Số người nhận tối đa mỗi lô", "int"),
+        new("POP3 / IMAP", "WelcomePOP3", "Lời chào POP3", "string"),
+        new("POP3 / IMAP", "WelcomeIMAP", "Lời chào IMAP", "string"),
+        new("Chống thư rác", "AntiSpam.SpamMarkThreshold", "Ngưỡng đánh dấu thư rác", "int"),
+        new("Chống thư rác", "AntiSpam.SpamDeleteThreshold", "Ngưỡng xoá thư rác", "int"),
+        new("Chống thư rác", "AntiSpam.PrependSubject", "Thêm tiền tố vào tiêu đề thư rác", "bool"),
+        new("Chống thư rác", "AntiSpam.PrependSubjectText", "Nội dung tiền tố", "string"),
+        new("Chống virus", "AntiVirus.ClamAVEnabled", "Bật ClamAV", "bool"),
+        new("Chống virus", "AntiVirus.ClamAVHost", "Máy chủ ClamAV", "string"),
+        new("Chống virus", "AntiVirus.ClamAVPort", "Cổng ClamAV", "int"),
+        new("Nhật ký", "Logging.Enabled", "Bật ghi log", "bool"),
+        new("Nhật ký", "Logging.LogApplication", "Log ứng dụng", "bool"),
+        new("Nhật ký", "Logging.LogSMTP", "Log SMTP", "bool"),
+        new("Nhật ký", "Logging.LogPOP3", "Log POP3", "bool"),
+        new("Nhật ký", "Logging.LogIMAP", "Log IMAP", "bool"),
+        new("Nhật ký", "Logging.LogTCPIP", "Log TCP/IP", "bool"),
+        new("Nhật ký", "Logging.LogDebug", "Log debug", "bool"),
+    };
+
+    public static (object Holder, string Prop) Resolve(object root, string path)
+    {
+        var parts = path.Split('.');
+        object cur = root;
+        for (int i = 0; i < parts.Length - 1; i++) cur = Get(cur, parts[i])!;
+        return (cur, parts[^1]);
+    }
+    public static object? Get(object o, string name) => o.GetType().InvokeMember(name, BindingFlags.GetProperty, null, o, null);
+    public static void Set(object o, string name, object v) => o.GetType().InvokeMember(name, BindingFlags.SetProperty, null, o, new[] { v });
+    public static string Short(Exception e) => (e is TargetInvocationException { InnerException: { } inner } ? inner : e).Message;
+}
+
+static class Dnsbl
+{
+    public static readonly string[] Zones =
+    {
+        "zen.spamhaus.org", "bl.spamcop.net", "b.barracudacentral.org", "psbl.surriel.com",
+        "dnsbl-1.uceprotect.net", "ix.dnsbl.manitu.net", "dnsbl.dronebl.org",
+    };
+
+    public static async Task<BlResult> CheckAsync(string reversedIp, string zone)
+    {
+        try
+        {
+            using var cts = new CancellationTokenSource(4000);
+            var found = await Dns.GetHostAddressesAsync($"{reversedIp}.{zone}", cts.Token);
+            var code = found.FirstOrDefault()?.ToString() ?? "";
+            // 127.255.255.x is the answer DNSBLs give to resolvers they refuse to serve (for example public DNS), not a listing.
+            if (code.StartsWith("127.255.255.")) return new BlResult(zone, "error", $"DNSBL từ chối truy vấn ({code}): thường do dùng DNS công cộng hoặc vượt hạn mức.");
+            return new BlResult(zone, "listed", code);
+        }
+        catch (SocketException e) when (e.SocketErrorCode is SocketError.HostNotFound or SocketError.NoData) { return new BlResult(zone, "clean", ""); }
+        catch (OperationCanceledException) { return new BlResult(zone, "error", "Hết thời gian chờ DNS."); }
+        catch (Exception e) { return new BlResult(zone, "error", e.Message); }
     }
 }

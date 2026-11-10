@@ -138,3 +138,41 @@ export const logsApi = {
     { type: 'POP3D', time: '2026-11-10 00:03:08.087', ip: '118.193.45.77', message: 'SENT: -ERR Invalid user name or password.' },
   ]) : http<LogLine[]>(`/logs/${name}/search?${qs(f)}`),
 }
+
+export type RuleCriteria = { field: string; header: string; match: string; value: string }
+export type RuleAction = { type: string; to: string; folder: string; header: string; value: string }
+export type Rule = { id: number; name: string; active: boolean; matchAll: boolean; supported: boolean; criteria: RuleCriteria[]; actions: RuleAction[] }
+export type RuleInput = Omit<Rule, 'id' | 'supported'>
+export type SettingValue = string | number | boolean
+export type SettingRow = { group: string; key: string; label: string; type: 'bool' | 'int' | 'string'; value: SettingValue | null; error: string | null }
+export type BlResult = { zone: string; status: 'listed' | 'clean' | 'error'; detail: string }
+
+const ruleStore: Rule[] = [{ id: 1, name: 'Thư rác vào thư mục Junk', active: true, matchAll: true, supported: true,
+  criteria: [{ field: 'header', header: 'X-hMailServer-Spam', match: 'equals', value: 'YES' }],
+  actions: [{ type: 'move', to: '', folder: 'INBOX.Junk', header: '', value: '' }, { type: 'stop', to: '', folder: '', header: '', value: '' }] }]
+const settingStore: SettingRow[] = [
+  { group: 'Chung', key: 'HostName', label: 'Tên máy chủ (host name)', type: 'string', value: 'mail.adsun.vn', error: null },
+  { group: 'Chung', key: 'MaxMessageSize', label: 'Kích thước thư tối đa (KB)', type: 'int', value: 20480, error: null },
+  { group: 'Nhật ký', key: 'Logging.Enabled', label: 'Bật ghi log', type: 'bool', value: true, error: null },
+]
+
+export const tools = {
+  rules: () => (MOCK ? wait(ruleStore) : http<Rule[]>('/rules')),
+  saveRule: (id: number | null, v: RuleInput) => MOCK ? run(() => {
+    if (id === null) ruleStore.push({ id: ++seq, supported: true, ...v }); else Object.assign(ruleStore.find(r => r.id === id)!, v)
+  }) : send('/rules', id, v),
+  deleteRule: (id: number) => MOCK ? run(() => drop(ruleStore, id)) : remove('/rules', id),
+  moveRule: (id: number, dir: 'up' | 'down') => MOCK ? run(() => {
+    const i = ruleStore.findIndex(r => r.id === id), j = dir === 'up' ? i - 1 : i + 1
+    if (j >= 0 && j < ruleStore.length) [ruleStore[i], ruleStore[j]] = [ruleStore[j], ruleStore[i]]
+  }) : http<void>(`/rules/${id}/move?dir=${dir}`, { method: 'POST' }),
+  settings: () => (MOCK ? wait(settingStore) : http<SettingRow[]>('/settings')),
+  saveSettings: (values: Record<string, SettingValue>) =>
+    MOCK ? wait({ errors: {} as Record<string, string> }) : http<{ errors: Record<string, string> }>('/settings', { method: 'PUT', body: JSON.stringify(values) }),
+  server: () => (MOCK ? wait({ state: 3 }) : http<{ state: number }>('/utilities/server')),
+  serverAction: (a: 'start' | 'stop') => (MOCK ? wait(undefined) : http<void>(`/utilities/server/${a}`, { method: 'POST' })),
+  backup: () => (MOCK ? wait(undefined) : http<void>('/utilities/backup', { method: 'POST' })),
+  blacklist: (ip: string) => MOCK ? wait<BlResult[]>([
+    { zone: 'zen.spamhaus.org', status: 'clean', detail: '' }, { zone: 'bl.spamcop.net', status: 'listed', detail: '127.0.0.2' },
+  ]) : http<BlResult[]>('/utilities/blacklist', { method: 'POST', body: JSON.stringify({ ip }) }),
+}
