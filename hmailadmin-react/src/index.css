@@ -1,0 +1,13 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Be Vietnam Pro", system-ui, sans-serif;
+  --color-ink: #14212b;
+  --color-mist: #eef2f3;
+  --color-line: #d9e1e4;
+  --color-signal: #0f8b8d;
+  --color-warn: #c8742a;
+  --color-muted: #5d6f7a;
+}
+body { @apply bg-mist text-ink font-sans antialiased; }
+:focus-visible { outline: 2px solid var(--color-signal); outline-offset: 2px; }
