@@ -1,9 +1,12 @@
 using System.IdentityModel.Tokens.Jwt;
 using System.Runtime.InteropServices;
 using System.Security.Claims;
+using DnsClient;
+using System.Formats.Asn1;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -526,6 +529,56 @@ api.MapPost("/utilities/blacklist", async (BlacklistRequest req) =>
     return Results.Ok(results);
 });
 
+// ---------- Diagnostics per domain ----------
+api.MapPost("/diagnostics", async (DiagRequest req) =>
+{
+    if (!HMail.ValidDomain(req.Domain)) return HMail.Bad("Tên miền không hợp lệ.");
+    if (!string.IsNullOrWhiteSpace(req.ServerIp) && !IPAddress.TryParse(req.ServerIp, out _)) return HMail.Bad("IP máy chủ không hợp lệ.");
+    if (!string.IsNullOrWhiteSpace(req.Selector) && !System.Text.RegularExpressions.Regex.IsMatch(req.Selector, @"^[A-Za-z0-9._-]{1,63}$")) return HMail.Bad("Selector DKIM không hợp lệ.");
+    dynamic hm = HMail.Connect();
+    dynamic? d = HMail.DomainOf(hm, "postmaster@" + req.Domain);
+    if (d is null) return HMail.Bad("Chỉ chẩn đoán được tên miền đã có trong hMailServer.");   // also keeps this endpoint from probing arbitrary domains
+    var checks = await Diag.RunAsync(req.Domain.ToLowerInvariant(), (bool)d.Active, req.ServerIp, req.Selector, (string)hm.Settings.HostName);
+    return Results.Ok(checks);
+});
+
+// ---------- SSL certificates ----------
+api.MapGet("/ssl", () =>
+{
+    dynamic hm = HMail.Connect();
+    string host = (string)hm.Settings.HostName;
+    dynamic col = hm.Settings.SSLCertificates;
+    var list = new List<CertRow>();
+    for (int i = 0; i < (int)col.Count; i++)
+    {
+        dynamic c = col.Item[i];
+        string cf = (string)c.CertificateFile, kf = (string)c.PrivateKeyFile;
+        list.Add(new CertRow((int)c.ID, (string)c.Name, cf, kf, CertCheck.Analyze(cf, kf, host)));
+    }
+    return list;
+});
+api.MapPost("/ssl", (CertInput i) =>
+{
+    if (string.IsNullOrWhiteSpace(i.Name) || string.IsNullOrWhiteSpace(i.CertificateFile) || string.IsNullOrWhiteSpace(i.PrivateKeyFile)) return HMail.Bad("Cần nhập tên, file chứng chỉ và file khoá riêng.");
+    dynamic c = HMail.Connect().Settings.SSLCertificates.Add();
+    c.Name = i.Name; c.CertificateFile = i.CertificateFile; c.PrivateKeyFile = i.PrivateKeyFile; c.Save();
+    return Results.NoContent();
+});
+api.MapPut("/ssl/{id:int}", (int id, CertInput i) =>
+{
+    dynamic? c = HMail.Find(HMail.Connect().Settings.SSLCertificates, id);
+    if (c is null) return Results.NotFound();
+    c.Name = i.Name; c.CertificateFile = i.CertificateFile; c.PrivateKeyFile = i.PrivateKeyFile; c.Save();
+    return Results.NoContent();
+});
+api.MapDelete("/ssl/{id:int}", (int id) =>
+{
+    dynamic? c = HMail.Find(HMail.Connect().Settings.SSLCertificates, id);
+    if (c is null) return Results.NotFound();
+    c.Delete();
+    return Results.NoContent();
+});
+
 app.MapFallbackToFile("index.html");
 app.Run();
 
@@ -844,5 +897,173 @@ static class Dnsbl
         catch (SocketException e) when (e.SocketErrorCode is SocketError.HostNotFound or SocketError.NoData) { return new BlResult(zone, "clean", ""); }
         catch (OperationCanceledException) { return new BlResult(zone, "error", "Hết thời gian chờ DNS."); }
         catch (Exception e) { return new BlResult(zone, "error", e.Message); }
+    }
+}
+
+record DiagRequest(string Domain, string? ServerIp, string? Selector);
+record DiagCheck(string Id, string Title, string Status, string Detail);
+record CertInfo(string? Subject, string? Issuer, string? NotAfter, int? DaysLeft, List<string> Names, bool? HostMatch, bool? KeyOk, string? Problem);
+record CertRow(int Id, string Name, string CertificateFile, string PrivateKeyFile, CertInfo Info);
+record CertInput(string Name, string CertificateFile, string PrivateKeyFile);
+
+static class Diag
+{
+    static readonly LookupClient Lookup = new(new LookupClientOptions { Timeout = TimeSpan.FromSeconds(4), Retries = 1, UseCache = false });
+
+    static async Task<List<string>> TxtAsync(string name)
+    {
+        try { return (await Lookup.QueryAsync(name, QueryType.TXT)).Answers.TxtRecords().Select(t => string.Concat(t.Text)).ToList(); }
+        catch { return new List<string>(); }
+    }
+
+    static async Task<string> BannerAsync(string host)
+    {
+        using var cts = new CancellationTokenSource(5000);
+        using var tcp = new TcpClient();
+        await tcp.ConnectAsync(host, 25, cts.Token);
+        var buf = new byte[256];
+        int n = await tcp.GetStream().ReadAsync(buf, cts.Token);
+        return Encoding.ASCII.GetString(buf, 0, n).Trim();
+    }
+
+    public static async Task<List<DiagCheck>> RunAsync(string domain, bool active, string? serverIp, string? selector, string host)
+    {
+        var checks = new List<DiagCheck>();
+        void Add(string id, string title, string status, string detail) => checks.Add(new DiagCheck(id, title, status, detail));
+        IPAddress.TryParse(serverIp, out var srv);
+
+        Add("local", "Tên miền trong hMailServer", active ? "ok" : "warn", active ? "Tên miền tồn tại và đang hoạt động." : "Tên miền tồn tại nhưng đang bị tắt, nên không nhận thư.");
+
+        // MX
+        var mxs = new List<(int Pref, string Host)>();
+        try { mxs = (await Lookup.QueryAsync(domain, QueryType.MX)).Answers.MxRecords().OrderBy(m => m.Preference).Select(m => ((int)m.Preference, m.Exchange.Value.TrimEnd('.'))).ToList(); }
+        catch (Exception e) { Add("mx", "Bản ghi MX", "fail", $"Không truy vấn được DNS: {e.Message}"); }
+        if (mxs.Count > 0) Add("mx", "Bản ghi MX", "ok", string.Join("; ", mxs.Select(m => $"{m.Pref} {m.Host}")));
+        else if (!checks.Any(c => c.Id == "mx")) Add("mx", "Bản ghi MX", "fail", "Chưa có bản ghi MX, thư từ bên ngoài sẽ không tới được tên miền này.");
+
+        var mxIps = new List<IPAddress>();
+        foreach (var m in mxs.Take(5))
+        {
+            try
+            {
+                var ips = (await Lookup.QueryAsync(m.Host, QueryType.A)).Answers.ARecords().Select(a => a.Address).ToList();
+                mxIps.AddRange(ips);
+                Add("mx-a:" + m.Host, $"A của {m.Host}", ips.Count > 0 ? "ok" : "fail", ips.Count > 0 ? string.Join(", ", ips) : "MX trỏ tới tên không có bản ghi A.");
+            }
+            catch (Exception e) { Add("mx-a:" + m.Host, $"A của {m.Host}", "fail", e.Message); }
+        }
+        if (srv is not null && mxs.Count > 0)
+            Add("mx-self", "MX trỏ về máy chủ này", mxIps.Contains(srv) ? "ok" : "fail", mxIps.Contains(srv) ? $"Có MX trỏ tới {srv}." : $"Không MX nào trỏ tới {srv}.");
+        else Add("mx-self", "MX trỏ về máy chủ này", "info", "Nhập IP công khai của máy chủ để kiểm tra mục này, PTR và host name.");
+
+        // Host name and reverse DNS
+        if (srv is not null)
+        {
+            if (!string.IsNullOrWhiteSpace(host))
+            {
+                try
+                {
+                    var hostIps = (await Lookup.QueryAsync(host, QueryType.A)).Answers.ARecords().Select(a => a.Address).ToList();
+                    Add("host-a", $"A của host name ({host})", hostIps.Contains(srv) ? "ok" : "warn", hostIps.Count == 0 ? "Host name chưa có bản ghi A." : $"Trỏ tới {string.Join(", ", hostIps)}.");
+                }
+                catch (Exception e) { Add("host-a", $"A của host name ({host})", "fail", e.Message); }
+            }
+            try
+            {
+                var ptr = (await Lookup.QueryReverseAsync(srv)).Answers.PtrRecords().Select(p => p.PtrDomainName.Value.TrimEnd('.')).ToList();
+                bool match = ptr.Any(n => string.Equals(n, host, StringComparison.OrdinalIgnoreCase));
+                Add("ptr", "Reverse DNS (PTR)", ptr.Count == 0 ? "fail" : match ? "ok" : "warn",
+                    ptr.Count == 0 ? $"{srv} chưa có PTR; nhiều máy chủ nhận thư từ chối thư gửi từ IP không có PTR." : $"{string.Join(", ", ptr)}{(match ? "" : $" (khác host name {host})")}");
+            }
+            catch (Exception e) { Add("ptr", "Reverse DNS (PTR)", "fail", e.Message); }
+        }
+
+        // SPF
+        var spf = (await TxtAsync(domain)).Where(t => t.StartsWith("v=spf1", StringComparison.OrdinalIgnoreCase)).ToList();
+        if (spf.Count == 0) Add("spf", "SPF", "warn", "Chưa có bản ghi TXT bắt đầu bằng v=spf1.");
+        else if (spf.Count > 1) Add("spf", "SPF", "fail", "Có nhiều hơn một bản ghi SPF; chuẩn chỉ cho phép một, nên kết quả sẽ không hợp lệ.");
+        else Add("spf", "SPF", spf[0].Contains("-all") || spf[0].Contains("~all") ? "ok" : "warn",
+                 spf[0] + (spf[0].Contains("-all") || spf[0].Contains("~all") ? "" : "  (nên kết thúc bằng -all hoặc ~all)"));
+
+        // DMARC
+        var dmarc = (await TxtAsync("_dmarc." + domain)).Where(t => t.StartsWith("v=DMARC1", StringComparison.OrdinalIgnoreCase)).ToList();
+        if (dmarc.Count == 0) Add("dmarc", "DMARC", "warn", $"Chưa có bản ghi TXT tại _dmarc.{domain}.");
+        else
+        {
+            var policy = System.Text.RegularExpressions.Regex.Match(dmarc[0], @"\bp=(\w+)", System.Text.RegularExpressions.RegexOptions.IgnoreCase).Groups[1].Value.ToLowerInvariant();
+            Add("dmarc", "DMARC", policy == "none" ? "warn" : "ok", dmarc[0] + (policy == "none" ? "  (p=none chỉ giám sát, chưa chặn thư giả mạo)" : ""));
+        }
+
+        // DKIM
+        if (string.IsNullOrWhiteSpace(selector)) Add("dkim", "DKIM", "info", "Nhập selector DKIM để kiểm tra bản ghi khoá công khai.");
+        else
+        {
+            var dk = (await TxtAsync($"{selector}._domainkey.{domain}")).FirstOrDefault(t => t.Contains("p="));
+            Add("dkim", $"DKIM ({selector})", dk is null ? "fail" : "ok", dk is null ? $"Không có bản ghi khoá công khai tại {selector}._domainkey.{domain}." : dk.Length > 120 ? dk[..120] + "…" : dk);
+        }
+
+        // Port 25 on the MX hosts, tested from this machine
+        foreach (var m in mxs.Take(3))
+        {
+            try
+            {
+                var banner = await BannerAsync(m.Host);
+                Add("smtp:" + m.Host, $"Cổng 25 của {m.Host}", banner.StartsWith("220") ? "ok" : "warn", banner.Length > 120 ? banner[..120] : banner);
+            }
+            catch (Exception e) { Add("smtp:" + m.Host, $"Cổng 25 của {m.Host}", "fail", e is OperationCanceledException ? "Hết thời gian chờ kết nối." : e.Message); }
+        }
+        return checks;
+    }
+}
+
+static class CertCheck
+{
+    public static CertInfo Analyze(string certFile, string keyFile, string host)
+    {
+        if (string.IsNullOrWhiteSpace(certFile) || !File.Exists(certFile))
+            return new CertInfo(null, null, null, null, new List<string>(), null, null, "Không tìm thấy file chứng chỉ trên máy chủ.");
+        try
+        {
+            using var cert = new X509Certificate2(certFile);
+            var names = SanNames(cert);
+            if (names.Count == 0 && cert.GetNameInfo(X509NameType.SimpleName, false) is { Length: > 0 } cn) names.Add(cn);
+            int days = (int)Math.Floor((cert.NotAfter - DateTime.Now).TotalDays);
+            bool? keyOk = null; string? problem = null;
+            if (string.IsNullOrWhiteSpace(keyFile) || !File.Exists(keyFile)) problem = "Không tìm thấy file khoá riêng trên máy chủ.";
+            else
+            {
+                try { using var pair = X509Certificate2.CreateFromPemFile(certFile, keyFile); keyOk = true; }
+                catch (Exception e) { problem = $"Không xác nhận được khoá riêng khớp chứng chỉ ({e.Message}). Có thể khoá có passphrase hoặc không ở dạng PEM."; }
+            }
+            return new CertInfo(cert.Subject, cert.Issuer, cert.NotAfter.ToString("yyyy-MM-dd"), days, names, HostMatches(host, names), keyOk, problem);
+        }
+        catch (Exception e) { return new CertInfo(null, null, null, null, new List<string>(), null, null, $"Không đọc được chứng chỉ: {e.Message}"); }
+    }
+
+    // Subject Alternative Name (2.5.29.17): GeneralNames, dNSName is context tag [2].
+    static List<string> SanNames(X509Certificate2 cert)
+    {
+        var names = new List<string>();
+        try
+        {
+            var ext = cert.Extensions["2.5.29.17"];
+            if (ext is null) return names;
+            var seq = new AsnReader(ext.RawData, AsnEncodingRules.DER).ReadSequence();
+            var dns = new Asn1Tag(TagClass.ContextSpecific, 2);
+            while (seq.HasData)
+            {
+                if (seq.PeekTag() == dns) names.Add(seq.ReadCharacterString(UniversalTagNumber.IA5String, dns));
+                else seq.ReadEncodedValue();
+            }
+        }
+        catch { /* keep what was read */ }
+        return names;
+    }
+
+    static bool? HostMatches(string host, List<string> names)
+    {
+        if (string.IsNullOrWhiteSpace(host) || names.Count == 0) return null;
+        return names.Any(n => string.Equals(n, host, StringComparison.OrdinalIgnoreCase) ||
+            (n.StartsWith("*.") && host.Contains('.') && string.Equals(n[2..], host[(host.IndexOf('.') + 1)..], StringComparison.OrdinalIgnoreCase)));
     }
 }

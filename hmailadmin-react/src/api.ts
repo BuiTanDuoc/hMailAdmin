@@ -176,3 +176,25 @@ export const tools = {
     { zone: 'zen.spamhaus.org', status: 'clean', detail: '' }, { zone: 'bl.spamcop.net', status: 'listed', detail: '127.0.0.2' },
   ]) : http<BlResult[]>('/utilities/blacklist', { method: 'POST', body: JSON.stringify({ ip }) }),
 }
+
+export type DiagCheck = { id: string; title: string; status: 'ok' | 'warn' | 'fail' | 'info'; detail: string }
+export type CertInfo = { subject: string | null; issuer: string | null; notAfter: string | null; daysLeft: number | null; names: string[]; hostMatch: boolean | null; keyOk: boolean | null; problem: string | null }
+export type SslCert = { id: number; name: string; certificateFile: string; privateKeyFile: string; info: CertInfo }
+export type SslInput = Omit<SslCert, 'id' | 'info'>
+
+const certStore: SslCert[] = [{ id: 1, name: 'mail.adsun.vn', certificateFile: 'C:\\ssl\\fullchain.pem', privateKeyFile: 'C:\\ssl\\privkey.pem',
+  info: { subject: 'CN=mail.adsun.vn', issuer: "CN=R11, O=Let's Encrypt", notAfter: '2027-01-12', daysLeft: 63, names: ['mail.adsun.vn'], hostMatch: true, keyOk: true, problem: null } }]
+
+export const ops = {
+  diagnose: (v: { domain: string; serverIp: string; selector: string }) => MOCK ? wait<DiagCheck[]>([
+    { id: 'local', title: 'Tên miền trong hMailServer', status: 'ok', detail: 'Tên miền tồn tại và đang hoạt động.' },
+    { id: 'mx', title: 'Bản ghi MX', status: 'ok', detail: `10 mail.${v.domain}` },
+    { id: 'spf', title: 'SPF', status: 'warn', detail: 'Chưa có bản ghi TXT bắt đầu bằng v=spf1.' },
+  ]) : http<DiagCheck[]>('/diagnostics', { method: 'POST', body: JSON.stringify(v) }),
+  certs: () => (MOCK ? wait(certStore) : http<SslCert[]>('/ssl')),
+  saveCert: (id: number | null, v: SslInput) => MOCK ? run(() => {
+    if (id === null) certStore.push({ id: ++seq, ...v, info: { ...certStore[0].info, problem: 'Bản mô phỏng: chưa phân tích file.' } })
+    else Object.assign(certStore.find(c => c.id === id)!, v)
+  }) : send('/ssl', id, v),
+  deleteCert: (id: number) => MOCK ? run(() => drop(certStore, id)) : remove('/ssl', id),
+}

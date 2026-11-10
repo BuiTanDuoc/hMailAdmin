@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { NavLink, Navigate, Route, Routes, useNavigate } from 'react-router-dom'
-import { api, auth, crud, ext, logsApi, tools, type Rule, type RuleInput, type RuleCriteria, type RuleAction, type SettingRow, type SettingValue, type BlResult, type LogFile, type LogLine, type LogSummary, type Account, type Alias, type DistList, type IpRange, type SecuritySettings, type Domain, type QueueItem, type Stats } from './api'
+import { api, auth, crud, ext, logsApi, tools, ops, type DiagCheck, type SslCert, type Rule, type RuleInput, type RuleCriteria, type RuleAction, type SettingRow, type SettingValue, type BlResult, type LogFile, type LogLine, type LogSummary, type Account, type Alias, type DistList, type IpRange, type SecuritySettings, type Domain, type QueueItem, type Stats } from './api'
 
 function useLoad<T>(fn: () => Promise<T>) {
   const [data, setData] = useState<T>()
@@ -620,6 +620,74 @@ function Utilities() {
   )
 }
 
+const diagTone = { ok: ['Đạt', 'text-signal'], warn: ['Cảnh báo', 'text-warn'], fail: ['Lỗi', 'text-warn'], info: ['Thông tin', 'text-muted'] } as const
+
+function Diagnostics() {
+  const { data: domains, error } = useLoad<Domain[]>(api.domains)
+  const [domain, setDomain] = useState('')
+  const [serverIp, setServerIp] = useState('')
+  const [selector, setSelector] = useState('')
+  const [res, setRes] = useState<DiagCheck[]>()
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+  useEffect(() => { if (!domain && domains?.length) setDomain(domains[0].name) }, [domains, domain])
+  const run = async (e: React.FormEvent) => {
+    e.preventDefault(); setBusy(true); setErr(''); setRes(undefined)
+    try { setRes(await ops.diagnose({ domain, serverIp: serverIp.trim(), selector: selector.trim() })) } catch (x) { setErr((x as Error).message) }
+    setBusy(false)
+  }
+  const f = 'rounded-lg border border-line bg-white px-3 py-2 text-sm'
+  const count = (k: DiagCheck['status']) => res?.filter(r => r.status === k).length ?? 0
+  return (
+    <Page title="Chẩn đoán tên miền" error={error}>
+      <form onSubmit={run} className="mb-6 flex flex-wrap items-end gap-3">
+        <label className="text-sm"><span className="mb-1 block text-muted">Tên miền</span>
+          <select aria-label="Tên miền" value={domain} onChange={e => setDomain(e.target.value)} className={f}>{(domains ?? []).map(d => <option key={d.id}>{d.name}</option>)}</select></label>
+        <label className="text-sm"><span className="mb-1 block text-muted">IP công khai của máy chủ (tuỳ chọn)</span>
+          <input value={serverIp} onChange={e => setServerIp(e.target.value)} placeholder="vd. 203.0.113.10" className={`${f} w-52`} /></label>
+        <label className="text-sm"><span className="mb-1 block text-muted">Selector DKIM (tuỳ chọn)</span>
+          <input value={selector} onChange={e => setSelector(e.target.value)} placeholder="vd. mail" className={`${f} w-40`} /></label>
+        <button disabled={busy || !domain} className="rounded-lg bg-ink px-4 py-2 text-sm font-medium text-white hover:bg-signal disabled:opacity-50">{busy ? 'Đang kiểm tra…' : 'Chạy chẩn đoán'}</button>
+      </form>
+      {err && <p role="alert" className="mb-4 text-sm text-warn">{err}</p>}
+      {res && <>
+        <p className="mb-3 text-sm text-muted">{count('ok')} đạt · {count('warn')} cảnh báo · {count('fail')} lỗi</p>
+        <Table heads={['Kiểm tra', 'Kết quả', 'Chi tiết']} empty="" rows={res.map(r => [r.title, <b key="s" className={diagTone[r.status][1]}>{diagTone[r.status][0]}</b>, <span key="d" className="break-all text-muted">{r.detail}</span>])} />
+        <p className="mt-3 max-w-2xl text-xs text-muted">Kiểm tra cổng 25 chạy từ chính máy chủ này nên có thể khác với kết quả nhìn từ Internet (NAT, tường lửa). Các bản ghi DNS lấy trực tiếp từ DNS, có thể chưa cập nhật nếu vừa thay đổi.</p>
+      </>}
+    </Page>
+  )
+}
+
+function Ssl() {
+  const { data, error, reload } = useLoad<SslCert[]>(ops.certs)
+  const [dlg, setDlg] = useState<SslCert | 'new' | null>(null)
+  const expiry = (c: SslCert) => {
+    const d = c.info.daysLeft
+    if (d === null || !c.info.notAfter) return '—'
+    return <span className={d <= 30 ? 'font-medium text-warn' : ''}>{c.info.notAfter} ({d < 0 ? 'đã hết hạn' : `còn ${d} ngày`})</span>
+  }
+  return (
+    <Page title="Chứng chỉ SSL" error={error}>
+      <div className="mb-4"><button onClick={() => setDlg('new')} className="rounded-lg bg-ink px-4 py-2 text-sm font-medium text-white hover:bg-signal">Thêm chứng chỉ</button></div>
+      <Table heads={['Tên', 'Chủ thể / tên miền', 'Hết hạn', 'Tình trạng', '']} empty="Chưa có chứng chỉ SSL."
+        rows={(data ?? []).map(c => [<b key="n">{c.name}</b>,
+          <span key="s" className="break-all">{c.info.names.join(', ') || c.info.subject || '—'}</span>, expiry(c),
+          <div key="t" className="space-y-0.5 text-xs">
+            {c.info.hostMatch === false && <p className="text-warn">Không khớp host name của máy chủ</p>}
+            {c.info.keyOk && <p className="text-signal">Khoá riêng khớp</p>}
+            {c.info.problem && <p className="text-warn">{c.info.problem}</p>}
+          </div>,
+          <Actions key="a" onEdit={() => setDlg(c)} onDelete={() => confirmDelete(`Xoá chứng chỉ ${c.name}?`, () => ops.deleteCert(c.id), reload)} />])} />
+      <p className="mt-3 max-w-2xl text-xs text-muted">Đường dẫn file là đường dẫn trên máy chủ hMailServer. Chứng chỉ chỉ có tác dụng khi một cổng TCP/IP được cấu hình dùng nó; thay đổi có thể cần khởi động lại dịch vụ hMailServer.</p>
+      {dlg && <FormDialog title={dlg === 'new' ? 'Thêm chứng chỉ SSL' : `Sửa ${dlg.name}`} onClose={() => setDlg(null)}
+        fields={[{ key: 'name', label: 'Tên', required: true }, { key: 'certificateFile', label: 'File chứng chỉ (.crt/.pem)', required: true }, { key: 'privateKeyFile', label: 'File khoá riêng (.key/.pem)', required: true }]}
+        initial={dlg === 'new' ? { name: '', certificateFile: '', privateKeyFile: '' } : { name: dlg.name, certificateFile: dlg.certificateFile, privateKeyFile: dlg.privateKeyFile }}
+        onSave={async v => { await ops.saveCert(dlg === 'new' ? null : dlg.id, { name: String(v.name).trim(), certificateFile: String(v.certificateFile).trim(), privateKeyFile: String(v.privateKeyFile).trim() }); reload() }} />}
+    </Page>
+  )
+}
+
 function Queue() {
   const { data, error, reload } = useLoad<QueueItem[]>(api.queue)
   const remove = async (id: number) => {
@@ -657,7 +725,7 @@ function Login() {
   )
 }
 
-const nav = [['/', 'Tổng quan'], ['/domains', 'Tên miền'], ['/accounts', 'Tài khoản'], ['/aliases', 'Alias'], ['/lists', 'Danh sách phân phối'], ['/ranges', 'IP ranges'], ['/security', 'Chống tấn công'], ['/rules', 'Rules'], ['/queue', 'Hàng đợi gửi'], ['/logs', 'Nhật ký'], ['/settings', 'Cài đặt'], ['/utilities', 'Tiện ích']]
+const nav = [['/', 'Tổng quan'], ['/domains', 'Tên miền'], ['/accounts', 'Tài khoản'], ['/aliases', 'Alias'], ['/lists', 'Danh sách phân phối'], ['/ranges', 'IP ranges'], ['/security', 'Chống tấn công'], ['/rules', 'Rules'], ['/queue', 'Hàng đợi gửi'], ['/logs', 'Nhật ký'], ['/settings', 'Cài đặt'], ['/utilities', 'Tiện ích'], ['/diagnostics', 'Chẩn đoán'], ['/ssl', 'Chứng chỉ SSL']]
 
 function Shell() {
   const go = useNavigate()
@@ -686,6 +754,8 @@ function Shell() {
           <Route path="rules" element={<Rules />} />
           <Route path="settings" element={<Settings />} />
           <Route path="utilities" element={<Utilities />} />
+          <Route path="diagnostics" element={<Diagnostics />} />
+          <Route path="ssl" element={<Ssl />} />
         </Routes>
       </main>
     </div>
