@@ -210,6 +210,107 @@ api.MapDelete("/aliases/{id:int}", (int id) =>
     return Results.NoContent();
 });
 
+api.MapGet("/lists", () =>
+{
+    dynamic hm = HMail.Connect();
+    var list = new List<object>();
+    for (int i = 0; i < (int)hm.Domains.Count; i++)
+    {
+        dynamic dls = hm.Domains.Item[i].DistributionLists;
+        for (int j = 0; j < (int)dls.Count; j++)
+        {
+            dynamic l = dls.Item[j];
+            var members = new List<string>();
+            for (int k = 0; k < (int)l.Recipients.Count; k++) members.Add((string)l.Recipients.Item[k].RecipientAddress);
+            list.Add(new { id = (int)l.ID, address = (string)l.Address, active = (bool)l.Active, members });
+        }
+    }
+    return list;
+});
+api.MapPost("/lists", (ListInput i) =>
+{
+    if (!HMail.ValidEmail(i.Address) || i.Members.Any(m => !HMail.ValidEmail(m))) return HMail.Bad("Có địa chỉ email không hợp lệ.");
+    dynamic? d = HMail.DomainOf(HMail.Connect(), i.Address);
+    if (d is null) return HMail.Bad("Tên miền của danh sách chưa tồn tại.");
+    dynamic l = d.DistributionLists.Add();
+    l.Address = i.Address; l.Active = i.Active; l.Save();   // save first so the list has an ID before members are added
+    HMail.SyncMembers(l, i.Members);
+    return Results.NoContent();
+});
+api.MapPut("/lists/{id:int}", (int id, ListInput i) =>
+{
+    if (i.Members.Any(m => !HMail.ValidEmail(m))) return HMail.Bad("Có địa chỉ email không hợp lệ.");
+    dynamic? l = HMail.FindIn(HMail.Connect(), "DistributionLists", id);
+    if (l is null) return Results.NotFound();
+    l.Active = i.Active; l.Save();                            // the list address is not renamed here
+    HMail.SyncMembers(l, i.Members);
+    return Results.NoContent();
+});
+api.MapDelete("/lists/{id:int}", (int id) =>
+{
+    dynamic? l = HMail.FindIn(HMail.Connect(), "DistributionLists", id);
+    if (l is null) return Results.NotFound();
+    l.Delete();
+    return Results.NoContent();
+});
+
+api.MapGet("/ranges", () =>
+{
+    dynamic rs = HMail.Connect().Settings.SecurityRanges;
+    var list = new List<object>();
+    for (int i = 0; i < (int)rs.Count; i++)
+    {
+        dynamic r = rs.Item[i];
+        list.Add(new { id = (int)r.ID, name = (string)r.Name, lowerIp = (string)r.LowerIP, upperIp = (string)r.UpperIP, priority = (int)r.Priority,
+                       allowSmtp = (bool)r.AllowSMTPConnections, allowPop = (bool)r.AllowPOP3Connections, allowImap = (bool)r.AllowIMAPConnections,
+                       expires = (bool)r.Expires ? HMail.FormatDate(r.ExpiresTime) : null });
+    }
+    return list;
+});
+api.MapPost("/ranges", (RangeInput i) =>
+{
+    if (HMail.CheckRange(i) is { } err) return HMail.Bad(err);
+    dynamic r = HMail.Connect().Settings.SecurityRanges.Add();
+    HMail.FillRange(r, i); r.Save();
+    return Results.NoContent();
+});
+api.MapPut("/ranges/{id:int}", (int id, RangeInput i) =>
+{
+    if (HMail.CheckRange(i) is { } err) return HMail.Bad(err);
+    dynamic? r = HMail.Find(HMail.Connect().Settings.SecurityRanges, id);
+    if (r is null) return Results.NotFound();
+    HMail.FillRange(r, i); r.Save();
+    return Results.NoContent();
+});
+api.MapDelete("/ranges/{id:int}", (int id) =>
+{
+    dynamic? r = HMail.Find(HMail.Connect().Settings.SecurityRanges, id);
+    if (r is null) return Results.NotFound();
+    r.Delete();
+    return Results.NoContent();
+});
+
+api.MapGet("/settings/security", () =>
+{
+    dynamic s = HMail.Connect().Settings; dynamic g = s.AntiSpam;
+    return new
+    {
+        autoBan = (bool)s.AutoBanOnLogonFailure, maxAttempts = (int)s.MaxInvalidLogonAttempts,
+        withinMinutes = (int)s.MaxInvalidLogonAttemptsWithin, banMinutes = (int)s.AutoBanMinutes,
+        greyEnabled = (bool)g.GreyListingEnabled, greyInitialDelayMin = (int)g.GreyListingInitialDelay,
+        greyInitialDeleteHours = (int)g.GreyListingInitialDelete, greyFinalDeleteHours = (int)g.GreyListingFinalDelete,
+    };
+});
+api.MapPut("/settings/security", (SecurityInput i) =>
+{
+    dynamic s = HMail.Connect().Settings; dynamic g = s.AntiSpam;
+    s.AutoBanOnLogonFailure = i.AutoBan; s.MaxInvalidLogonAttempts = i.MaxAttempts;
+    s.MaxInvalidLogonAttemptsWithin = i.WithinMinutes; s.AutoBanMinutes = i.BanMinutes;
+    g.GreyListingEnabled = i.GreyEnabled; g.GreyListingInitialDelay = i.GreyInitialDelayMin;
+    g.GreyListingInitialDelete = i.GreyInitialDeleteHours; g.GreyListingFinalDelete = i.GreyFinalDeleteHours;
+    return Results.NoContent();
+});
+
 app.MapFallbackToFile("index.html");
 app.Run();
 
@@ -217,6 +318,9 @@ record LoginRequest(string Username, string Password);
 record DomainInput(string Name, bool Active, int QuotaMb);
 record AccountInput(string Address, string? Password, bool Active, int QuotaMb);
 record AliasInput(string Name, string Value, bool Active);
+record ListInput(string Address, bool Active, string[] Members);
+record RangeInput(string Name, string LowerIp, string UpperIp, int Priority, bool AllowSmtp, bool AllowPop, bool AllowImap);
+record SecurityInput(bool AutoBan, int MaxAttempts, int WithinMinutes, int BanMinutes, bool GreyEnabled, int GreyInitialDelayMin, int GreyInitialDeleteHours, int GreyFinalDeleteHours);
 
 static class HMail
 {
@@ -235,12 +339,13 @@ static class HMail
         for (int i = 0; i < (int)col.Count; i++) { dynamic it = col.Item[i]; if ((int)it.ID == id) return it; }
         return null;
     }
-    public static dynamic? FindIn(dynamic hm, string child, int id)   // child = "Accounts" | "Aliases"
+    public static dynamic? FindIn(dynamic hm, string child, int id)   // child = "Accounts" | "Aliases" | "DistributionLists"
     {
         for (int i = 0; i < (int)hm.Domains.Count; i++)
         {
             dynamic d = hm.Domains.Item[i];
-            dynamic? hit = Find(child == "Accounts" ? d.Accounts : d.Aliases, id);
+            dynamic coll = child == "Accounts" ? d.Accounts : child == "Aliases" ? d.Aliases : d.DistributionLists;
+            dynamic? hit = Find(coll, id);
             if (hit is not null) return hit;
         }
         return null;
@@ -254,6 +359,31 @@ static class HMail
             if (string.Equals((string)d.Name, name, StringComparison.OrdinalIgnoreCase)) return d;
         }
         return null;
+    }
+
+    public static void SyncMembers(dynamic list, IEnumerable<string> want)
+    {
+        var w = want.Select(x => x.Trim().ToLowerInvariant()).Where(x => x.Length > 0).ToHashSet();
+        dynamic rec = list.Recipients;
+        for (int k = (int)rec.Count - 1; k >= 0; k--)
+        {
+            dynamic r = rec.Item[k];
+            if (!w.Remove(((string)r.RecipientAddress).ToLowerInvariant())) r.Delete();
+        }
+        foreach (var addr in w) { dynamic r = rec.Add(); r.RecipientAddress = addr; r.Save(); }
+    }
+
+    public static string? CheckRange(RangeInput i)
+    {
+        if (string.IsNullOrWhiteSpace(i.Name)) return "Tên không được để trống.";
+        if (!System.Net.IPAddress.TryParse(i.LowerIp, out var lo) || !System.Net.IPAddress.TryParse(i.UpperIp, out var hi)) return "Địa chỉ IP không hợp lệ.";
+        if (lo.AddressFamily != hi.AddressFamily) return "IP bắt đầu và IP kết thúc phải cùng loại (IPv4 hoặc IPv6).";
+        return null;
+    }
+    public static void FillRange(dynamic r, RangeInput i)
+    {
+        r.Name = i.Name; r.LowerIP = i.LowerIp; r.UpperIP = i.UpperIp; r.Priority = i.Priority;
+        r.AllowSMTPConnections = i.AllowSmtp; r.AllowPOP3Connections = i.AllowPop; r.AllowIMAPConnections = i.AllowImap;
     }
 
     public static string FormatDate(object? v)

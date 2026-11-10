@@ -86,3 +86,31 @@ export const crud = {
   }) : send('/aliases', id, v),
   deleteAlias: (id: number) => MOCK ? run(() => drop(aliasStore, id)) : remove('/aliases', id),
 }
+
+export type DistList = { id: number; address: string; active: boolean; members: string[] }
+export type IpRange = { id: number; name: string; lowerIp: string; upperIp: string; priority: number; allowSmtp: boolean; allowPop: boolean; allowImap: boolean; expires: string | null }
+export type SecuritySettings = {
+  autoBan: boolean; maxAttempts: number; withinMinutes: number; banMinutes: number
+  greyEnabled: boolean; greyInitialDelayMin: number; greyInitialDeleteHours: number; greyFinalDeleteHours: number
+}
+export type ListInput = Omit<DistList, 'id'>
+export type RangeInput = Omit<IpRange, 'id' | 'expires'>
+
+const listStore: DistList[] = [{ id: 1, address: 'all@adsun.vn', active: true, members: ['kiem@adsun.vn', 'support@adgps.vn'] }]
+const rangeStore: IpRange[] = [{ id: 1, name: 'Mạng nội bộ', lowerIp: '192.168.1.1', upperIp: '192.168.1.254', priority: 20, allowSmtp: true, allowPop: true, allowImap: true, expires: null }]
+let secStore: SecuritySettings = { autoBan: true, maxAttempts: 3, withinMinutes: 30, banMinutes: 60, greyEnabled: false, greyInitialDelayMin: 1, greyInitialDeleteHours: 24, greyFinalDeleteHours: 720 }
+
+export const ext = {
+  lists: () => (MOCK ? wait(listStore) : http<DistList[]>('/lists')),
+  saveList: (id: number | null, v: ListInput) => MOCK ? run(() => {
+    if (id === null) listStore.push({ id: ++seq, ...v }); else Object.assign(listStore.find(x => x.id === id)!, v)
+  }) : send('/lists', id, v),
+  deleteList: (id: number) => MOCK ? run(() => drop(listStore, id)) : remove('/lists', id),
+  ranges: () => (MOCK ? wait(rangeStore) : http<IpRange[]>('/ranges')),
+  saveRange: (id: number | null, v: RangeInput) => MOCK ? run(() => {
+    if (id === null) rangeStore.push({ id: ++seq, expires: null, ...v }); else Object.assign(rangeStore.find(x => x.id === id)!, v)
+  }) : send('/ranges', id, v),
+  deleteRange: (id: number) => MOCK ? run(() => drop(rangeStore, id)) : remove('/ranges', id),
+  security: () => (MOCK ? wait(secStore) : http<SecuritySettings>('/settings/security')),
+  saveSecurity: (v: SecuritySettings) => MOCK ? run(() => { secStore = v }) : http<void>('/settings/security', { method: 'PUT', body: JSON.stringify(v) }),
+}

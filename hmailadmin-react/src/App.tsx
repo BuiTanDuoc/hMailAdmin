@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import { NavLink, Navigate, Route, Routes, useNavigate } from 'react-router-dom'
-import { api, auth, crud, type Account, type Alias, type Domain, type QueueItem, type Stats } from './api'
+import { api, auth, crud, ext, type Account, type Alias, type DistList, type IpRange, type SecuritySettings, type Domain, type QueueItem, type Stats } from './api'
 
 function useLoad<T>(fn: () => Promise<T>) {
   const [data, setData] = useState<T>()
@@ -95,7 +95,7 @@ function Dashboard() {
   )
 }
 
-type Field = { key: string; label: string; type?: 'text' | 'password' | 'number' | 'checkbox'; required?: boolean; readOnly?: boolean; hint?: string }
+type Field = { key: string; label: string; type?: 'text' | 'password' | 'number' | 'checkbox' | 'textarea'; required?: boolean; readOnly?: boolean; hint?: string }
 type Values = Record<string, string | number | boolean>
 
 function FormDialog({ title, fields, initial, onSave, onClose }: {
@@ -117,7 +117,13 @@ function FormDialog({ title, fields, initial, onSave, onClose }: {
     <div role="dialog" aria-modal="true" aria-label={title} className="fixed inset-0 z-10 grid place-items-center bg-ink/50 p-4">
       <form onSubmit={submit} className="w-full max-w-md space-y-4 rounded-2xl bg-white p-6">
         <h2 className="text-lg font-semibold">{title}</h2>
-        {fields.map((f, i) => f.type === 'checkbox' ? (
+        {fields.map((f, i) => f.type === 'textarea' ? (
+          <label key={f.key} className="block text-sm">
+            <span className="mb-1 block text-muted">{f.label}</span>
+            <textarea className={input} rows={5} value={String(v[f.key] ?? '')} onChange={e => setV({ ...v, [f.key]: e.target.value })} />
+            {f.hint && <span className="mt-1 block text-xs text-muted">{f.hint}</span>}
+          </label>
+        ) : f.type === 'checkbox' ? (
           <label key={f.key} className="flex items-center gap-2 text-sm">
             <input type="checkbox" checked={!!v[f.key]} onChange={e => setV({ ...v, [f.key]: e.target.checked })} />{f.label}
           </label>
@@ -222,6 +228,87 @@ function Aliases() {
   )
 }
 
+const lines = (t: string) => t.split(/[\s,;]+/).map(x => x.trim().toLowerCase()).filter(Boolean)
+
+function Lists() {
+  const { data, error, reload } = useLoad<DistList[]>(ext.lists)
+  const [q, setQ] = useState('')
+  const [dlg, setDlg] = useState<DistList | 'new' | null>(null)
+  const rows = (data ?? []).filter(l => l.address.includes(q.toLowerCase()))
+  return (
+    <Page title="Danh sách phân phối" error={error}>
+      <Head q={q} setQ={setQ} label="Tìm danh sách" addLabel="Thêm danh sách" onAdd={() => setDlg('new')} />
+      <Table heads={['Địa chỉ', 'Trạng thái', 'Thành viên', '']} empty="Chưa có danh sách phân phối."
+        rows={rows.map(l => [<b key="n">{l.address}</b>, <Status key="s" active={l.active} />, `${l.members.length} địa chỉ`,
+          <Actions key="a" onEdit={() => setDlg(l)} onDelete={() => confirmDelete(`Xoá danh sách ${l.address}?`, () => ext.deleteList(l.id), reload)} />])} />
+      {dlg && <FormDialog title={dlg === 'new' ? 'Thêm danh sách phân phối' : `Sửa ${dlg.address}`} onClose={() => setDlg(null)}
+        fields={[{ key: 'address', label: 'Địa chỉ danh sách', required: true }, { key: 'members', label: 'Thành viên', type: 'textarea', hint: 'Mỗi địa chỉ một dòng' }, { key: 'active', label: 'Đang hoạt động', type: 'checkbox' }]}
+        initial={dlg === 'new' ? { address: '', members: '', active: true } : { address: dlg.address, members: dlg.members.join('\n'), active: dlg.active }}
+        onSave={async v => { await ext.saveList(dlg === 'new' ? null : dlg.id, { address: String(v.address).trim().toLowerCase(), members: lines(String(v.members)), active: !!v.active }); reload() }} />}
+    </Page>
+  )
+}
+
+function Ranges() {
+  const { data, error, reload } = useLoad<IpRange[]>(ext.ranges)
+  const [q, setQ] = useState('')
+  const [dlg, setDlg] = useState<IpRange | 'new' | null>(null)
+  const rows = (data ?? []).filter(r => (r.name + r.lowerIp + r.upperIp).toLowerCase().includes(q.toLowerCase()))
+  const svc = (r: IpRange) => [r.allowSmtp && 'SMTP', r.allowPop && 'POP3', r.allowImap && 'IMAP'].filter(Boolean).join(', ') || 'Không'
+  return (
+    <Page title="IP ranges" error={error}>
+      <Head q={q} setQ={setQ} label="Tìm theo tên hoặc IP" addLabel="Thêm IP range" onAdd={() => setDlg('new')} />
+      <Table heads={['Tên', 'Dải IP', 'Ưu tiên', 'Cho phép kết nối', 'Hết hạn', '']} empty="Chưa có IP range."
+        rows={rows.map(r => [<b key="n">{r.name}</b>, `${r.lowerIp} – ${r.upperIp}`, r.priority, svc(r), r.expires ?? '—',
+          <Actions key="a" onEdit={() => setDlg(r)} onDelete={() => confirmDelete(`Xoá IP range ${r.name}?`, () => ext.deleteRange(r.id), reload)} />])} />
+      {dlg && <FormDialog title={dlg === 'new' ? 'Thêm IP range' : `Sửa ${dlg.name}`} onClose={() => setDlg(null)}
+        fields={[{ key: 'name', label: 'Tên', required: true }, { key: 'lowerIp', label: 'IP bắt đầu', required: true }, { key: 'upperIp', label: 'IP kết thúc', required: true },
+          { key: 'priority', label: 'Ưu tiên', type: 'number', hint: 'Số lớn hơn được áp dụng trước' },
+          { key: 'allowSmtp', label: 'Cho phép SMTP', type: 'checkbox' }, { key: 'allowPop', label: 'Cho phép POP3', type: 'checkbox' }, { key: 'allowImap', label: 'Cho phép IMAP', type: 'checkbox' }]}
+        initial={dlg === 'new' ? { name: '', lowerIp: '', upperIp: '', priority: 10, allowSmtp: true, allowPop: true, allowImap: true }
+          : { name: dlg.name, lowerIp: dlg.lowerIp, upperIp: dlg.upperIp, priority: dlg.priority, allowSmtp: dlg.allowSmtp, allowPop: dlg.allowPop, allowImap: dlg.allowImap }}
+        onSave={async v => { await ext.saveRange(dlg === 'new' ? null : dlg.id, { name: String(v.name).trim(), lowerIp: String(v.lowerIp).trim(), upperIp: String(v.upperIp).trim(), priority: Number(v.priority), allowSmtp: !!v.allowSmtp, allowPop: !!v.allowPop, allowImap: !!v.allowImap }); reload() }} />}
+    </Page>
+  )
+}
+
+function Security() {
+  const { data, error } = useLoad<SecuritySettings>(ext.security)
+  const [v, setV] = useState<SecuritySettings>()
+  const [msg, setMsg] = useState('')
+  useEffect(() => setV(data), [data])
+  const num = (k: keyof SecuritySettings, label: string) => (
+    <label key={String(k)} className="block text-sm"><span className="mb-1 block text-muted">{label}</span>
+      <input type="number" min={0} value={Number(v![k])} onChange={e => setV({ ...v!, [k]: Number(e.target.value) })} className="w-40 rounded-lg border border-line px-3 py-2" /></label>
+  )
+  const check = (k: keyof SecuritySettings, label: string) => (
+    <label key={String(k)} className="flex items-center gap-2 text-sm"><input type="checkbox" checked={!!v![k]} onChange={e => setV({ ...v!, [k]: e.target.checked })} />{label}</label>
+  )
+  const save = async () => { try { await ext.saveSecurity(v!); setMsg('Đã lưu thay đổi.') } catch (e) { setMsg((e as Error).message) } }
+  return (
+    <Page title="Chống tấn công" error={error}>
+      {!v ? <p className="text-muted">Đang tải…</p> : (
+        <div className="max-w-xl space-y-6">
+          <div className="space-y-4 rounded-xl border border-line bg-white p-6">
+            <h2 className="font-semibold">Tự động chặn IP (auto-ban)</h2>
+            {check('autoBan', 'Chặn IP khi đăng nhập sai nhiều lần')}
+            {num('maxAttempts', 'Số lần sai tối đa')}{num('withinMinutes', 'Trong vòng (phút)')}{num('banMinutes', 'Thời gian chặn (phút)')}
+          </div>
+          <div className="space-y-4 rounded-xl border border-line bg-white p-6">
+            <h2 className="font-semibold">Greylisting</h2>
+            {check('greyEnabled', 'Bật greylisting')}
+            {num('greyInitialDelayMin', 'Trì hoãn ban đầu (phút)')}{num('greyInitialDeleteHours', 'Xoá bản ghi chưa xác nhận sau (giờ)')}{num('greyFinalDeleteHours', 'Xoá bản ghi đã xác nhận sau (giờ)')}
+          </div>
+          <div className="flex items-center gap-4">
+            <button onClick={save} className="rounded-lg bg-ink px-4 py-2 text-sm font-medium text-white hover:bg-signal">Lưu thay đổi</button>
+            {msg && <p role="status" className="text-sm text-muted">{msg}</p>}
+          </div>
+        </div>
+      )}
+    </Page>
+  )
+}
+
 function Queue() {
   const { data, error, reload } = useLoad<QueueItem[]>(api.queue)
   const remove = async (id: number) => {
@@ -259,7 +346,7 @@ function Login() {
   )
 }
 
-const nav = [['/', 'Tổng quan'], ['/domains', 'Tên miền'], ['/accounts', 'Tài khoản'], ['/aliases', 'Alias'], ['/queue', 'Hàng đợi gửi']]
+const nav = [['/', 'Tổng quan'], ['/domains', 'Tên miền'], ['/accounts', 'Tài khoản'], ['/aliases', 'Alias'], ['/lists', 'Danh sách phân phối'], ['/ranges', 'IP ranges'], ['/security', 'Chống tấn công'], ['/queue', 'Hàng đợi gửi']]
 
 function Shell() {
   const go = useNavigate()
@@ -280,6 +367,9 @@ function Shell() {
           <Route path="domains" element={<Domains />} />
           <Route path="accounts" element={<Accounts />} />
           <Route path="aliases" element={<Aliases />} />
+          <Route path="lists" element={<Lists />} />
+          <Route path="ranges" element={<Ranges />} />
+          <Route path="security" element={<Security />} />
           <Route path="queue" element={<Queue />} />
         </Routes>
       </main>
