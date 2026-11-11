@@ -18,7 +18,10 @@ async function http<T>(path: string, init: RequestInit = {}): Promise<T> {
   })
   if (res.status === 401 && auth.token && path !== '/auth/login') { auth.set(null); location.assign('/login') } // expired session only, not a failed login
   if (!res.ok) { const t = await res.text(); let m = t; try { m = JSON.parse(t).detail ?? t } catch { /* plain text */ } throw new Error(m || res.statusText) }
-  return res.status === 204 ? (undefined as T) : res.json()
+  if (res.status === 204) return undefined as T
+  if (!(res.headers.get('content-type') ?? '').includes('json'))
+    throw new Error('Bridge trả về trang HTML thay vì JSON: có thể bridge đang chạy bản cũ chưa có API này. Hãy cập nhật HMailBridge và khởi động lại.')
+  return res.json()
 }
 
 const mock = {
@@ -215,4 +218,19 @@ export const more = {
     if (id === null) dnsblStore.push({ id: ++seq, ...v }); else Object.assign(dnsblStore.find(x => x.id === id)!, v)
   }) : send('/dnsbl', id, v),
   deleteDnsbl: (id: number) => MOCK ? run(() => drop(dnsblStore, id)) : remove('/dnsbl', id),
+}
+
+export type Port = { id: number; protocol: number; address: string; port: number; security: number; certificateId: number; listening: boolean }
+export type PortInput = Omit<Port, 'id' | 'listening'>
+const portStore: Port[] = [
+  { id: 1, protocol: 1, address: '0.0.0.0', port: 25, security: 2, certificateId: 1, listening: true },
+  { id: 2, protocol: 1, address: '0.0.0.0', port: 587, security: 3, certificateId: 1, listening: true },
+  { id: 3, protocol: 5, address: '0.0.0.0', port: 143, security: 0, certificateId: 0, listening: false },
+]
+export const net = {
+  ports: () => (MOCK ? wait(portStore) : http<Port[]>('/ports')),
+  savePort: (id: number | null, v: PortInput) => MOCK ? run(() => {
+    if (id === null) portStore.push({ id: ++seq, listening: false, ...v }); else Object.assign(portStore.find(x => x.id === id)!, v)
+  }) : send('/ports', id, v),
+  deletePort: (id: number) => MOCK ? run(() => drop(portStore, id)) : remove('/ports', id),
 }

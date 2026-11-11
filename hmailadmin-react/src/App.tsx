@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { NavLink, Navigate, Route, Routes, useNavigate } from 'react-router-dom'
-import { api, auth, crud, ext, logsApi, tools, ops, more, type Dnsbl, type DiagCheck, type SslCert, type Rule, type RuleInput, type RuleCriteria, type RuleAction, type SettingRow, type SettingValue, type BlResult, type LogFile, type LogLine, type LogSummary, type Account, type Alias, type DistList, type IpRange, type SecuritySettings, type Domain, type QueueItem, type Stats } from './api'
+import { api, auth, crud, ext, logsApi, tools, ops, more, net, type Port, type PortInput, type Dnsbl, type DiagCheck, type SslCert, type Rule, type RuleInput, type RuleCriteria, type RuleAction, type SettingRow, type SettingValue, type BlResult, type LogFile, type LogLine, type LogSummary, type Account, type Alias, type DistList, type IpRange, type SecuritySettings, type Domain, type QueueItem, type Stats } from './api'
 
 function useLoad<T>(fn: () => Promise<T>) {
   const [data, setData] = useState<T>()
@@ -121,7 +121,7 @@ function Dashboard() {
   )
 }
 
-type Field = { key: string; label: string; type?: 'text' | 'password' | 'number' | 'checkbox' | 'textarea'; required?: boolean; readOnly?: boolean; hint?: string }
+type Field = { key: string; label: string; type?: 'text' | 'password' | 'number' | 'checkbox' | 'textarea' | 'select'; options?: [string, string][]; required?: boolean; readOnly?: boolean; hint?: string }
 type Values = Record<string, string | number | boolean>
 
 function FormDialog({ title, fields, initial, onSave, onClose }: {
@@ -143,7 +143,15 @@ function FormDialog({ title, fields, initial, onSave, onClose }: {
     <div role="dialog" aria-modal="true" aria-label={title} className="fixed inset-0 z-10 grid place-items-center bg-ink/50 p-4">
       <form onSubmit={submit} className="w-full max-w-md space-y-4 rounded-2xl bg-white p-6">
         <h2 className="text-lg font-semibold">{title}</h2>
-        {fields.map((f, i) => f.type === 'textarea' ? (
+        {fields.map((f, i) => f.type === 'select' ? (
+          <label key={f.key} className="block text-sm">
+            <span className="mb-1 block text-muted">{f.label}</span>
+            <select className={input} value={String(v[f.key] ?? '')} onChange={e => setV({ ...v, [f.key]: e.target.value })}>
+              {(f.options ?? []).map(([k, t]) => <option key={k} value={k}>{t}</option>)}
+            </select>
+            {f.hint && <span className="mt-1 block text-xs text-muted">{f.hint}</span>}
+          </label>
+        ) : f.type === 'textarea' ? (
           <label key={f.key} className="block text-sm">
             <span className="mb-1 block text-muted">{f.label}</span>
             <textarea className={input} rows={5} value={String(v[f.key] ?? '')} onChange={e => setV({ ...v, [f.key]: e.target.value })} />
@@ -771,6 +779,44 @@ function Live() {
   )
 }
 
+const PROTO: [string, string][] = [['1', 'SMTP'], ['3', 'POP3'], ['5', 'IMAP']]
+const SECURITY: [string, string][] = [['0', 'Không mã hoá'], ['1', 'SSL/TLS (ngầm định)'], ['2', 'STARTTLS (tuỳ chọn)'], ['3', 'STARTTLS (bắt buộc)']]
+const PRESETS: { label: string; v: PortInput }[] = [
+  { label: 'SMTP 465 (SSL/TLS)', v: { protocol: 1, address: '0.0.0.0', port: 465, security: 1, certificateId: 0 } },
+  { label: 'IMAP 993 (SSL/TLS)', v: { protocol: 5, address: '0.0.0.0', port: 993, security: 1, certificateId: 0 } },
+  { label: 'POP3 995 (SSL/TLS)', v: { protocol: 3, address: '0.0.0.0', port: 995, security: 1, certificateId: 0 } },
+]
+
+function Ports() {
+  const { data, error, reload } = useLoad<Port[]>(net.ports)
+  const certs = useLoad<SslCert[]>(ops.certs)
+  const [dlg, setDlg] = useState<Port | PortInput | null>(null)
+  const certOpts: [string, string][] = [['0', '— không dùng —'], ...(certs.data ?? []).map(c => [String(c.id), c.name] as [string, string])]
+  const certName = (id: number) => (id ? certs.data?.find(c => c.id === id)?.name ?? `#${id}` : '—')
+  const editing = dlg && 'id' in dlg ? dlg : null
+  return (
+    <Page title="TCP/IP ports" error={error}>
+      <p className="mb-4 max-w-2xl text-sm text-muted">Các cổng hMailServer lắng nghe. Cài mới chỉ có 25, 587, 110 và 143, đều không mã hoá; cổng 465, 993 và 995 phải tự thêm. Thay đổi có thể cần khởi động lại dịch vụ hMailServer mới có hiệu lực.</p>
+      <div className="mb-4 flex flex-wrap items-center gap-3">
+        <button onClick={() => setDlg({ protocol: 1, address: '0.0.0.0', port: 25, security: 0, certificateId: 0 })} className="rounded-lg bg-ink px-4 py-2 text-sm font-medium text-white hover:bg-signal">Thêm cổng</button>
+        {PRESETS.map(p => <button key={p.label} onClick={() => setDlg(p.v)} className="text-sm font-medium text-signal hover:underline">+ {p.label}</button>)}
+      </div>
+      <Table heads={['Giao thức', 'Địa chỉ', 'Cổng', 'Bảo mật', 'Chứng chỉ', 'Kết nối thử', '']} empty="Chưa có cổng nào."
+        rows={(data ?? []).map(p => [<b key="p">{label(PROTO, String(p.protocol))}</b>, p.address, p.port, label(SECURITY, String(p.security)), certName(p.certificateId),
+          <span key="l" className={p.listening ? 'text-signal' : 'text-warn'}>{p.listening ? 'Đang mở' : 'Không kết nối được'}</span>,
+          <Actions key="a" onEdit={() => setDlg(p)}
+            onDelete={() => confirmDelete(`Xoá cổng ${label(PROTO, String(p.protocol))} ${p.port}? Dịch vụ này sẽ không còn nhận kết nối trên cổng đó.`, () => net.deletePort(p.id), reload)} />])} />
+      <p className="mt-3 max-w-2xl text-xs text-muted">"Kết nối thử" là bridge thử kết nối tới cổng từ chính máy chủ này. "Không kết nối được" có thể do cổng mới thêm chưa áp dụng, hoặc hMailServer không bind được (cổng bị chương trình khác dùng; xem log ERROR).</p>
+      {dlg && <FormDialog title={editing ? `Sửa cổng ${editing.port}` : 'Thêm cổng'} onClose={() => setDlg(null)}
+        fields={[{ key: 'protocol', label: 'Giao thức', type: 'select', options: PROTO }, { key: 'address', label: 'Địa chỉ IP', required: true, hint: '0.0.0.0 = mọi địa chỉ IPv4; :: = mọi địa chỉ IPv6' },
+          { key: 'port', label: 'Cổng', type: 'number', required: true }, { key: 'security', label: 'Bảo mật kết nối', type: 'select', options: SECURITY },
+          { key: 'certificateId', label: 'Chứng chỉ SSL', type: 'select', options: certOpts, hint: 'Bắt buộc khi chọn SSL/TLS hoặc STARTTLS' }]}
+        initial={{ protocol: String(dlg.protocol), address: dlg.address, port: dlg.port, security: String(dlg.security), certificateId: String(dlg.certificateId) }}
+        onSave={async v => { await net.savePort(editing ? editing.id : null, { protocol: Number(v.protocol), address: String(v.address).trim(), port: Number(v.port), security: Number(v.security), certificateId: Number(v.certificateId) }); reload() }} />}
+    </Page>
+  )
+}
+
 function Queue() {
   const { data, error, reload } = useLoad<QueueItem[]>(api.queue)
   const remove = async (id: number) => {
@@ -808,7 +854,7 @@ function Login() {
   )
 }
 
-const nav = [['/', 'Tổng quan'], ['/domains', 'Tên miền'], ['/accounts', 'Tài khoản'], ['/aliases', 'Alias'], ['/lists', 'Danh sách phân phối'], ['/ranges', 'IP ranges'], ['/security', 'Chống tấn công'], ['/rules', 'Rules'], ['/queue', 'Hàng đợi gửi'], ['/logs', 'Nhật ký'], ['/settings', 'Cài đặt'], ['/utilities', 'Tiện ích'], ['/diagnostics', 'Chẩn đoán'], ['/ssl', 'Chứng chỉ SSL'], ['/dnsbl', 'DNS blacklists'], ['/live', 'Live logging']]
+const nav = [['/', 'Tổng quan'], ['/domains', 'Tên miền'], ['/accounts', 'Tài khoản'], ['/aliases', 'Alias'], ['/lists', 'Danh sách phân phối'], ['/ranges', 'IP ranges'], ['/security', 'Chống tấn công'], ['/rules', 'Rules'], ['/queue', 'Hàng đợi gửi'], ['/logs', 'Nhật ký'], ['/settings', 'Cài đặt'], ['/utilities', 'Tiện ích'], ['/diagnostics', 'Chẩn đoán'], ['/ssl', 'Chứng chỉ SSL'], ['/dnsbl', 'DNS blacklists'], ['/live', 'Live logging'], ['/ports', 'TCP/IP ports']]
 
 function Shell() {
   const go = useNavigate()
@@ -841,6 +887,7 @@ function Shell() {
           <Route path="ssl" element={<Ssl />} />
           <Route path="dnsbl" element={<Dnsbls />} />
           <Route path="live" element={<Live />} />
+          <Route path="ports" element={<Ports />} />
         </Routes>
       </main>
     </div>

@@ -102,8 +102,8 @@ api.MapGet("/stats", (SessionSampler sampler, ILogger<Program> log) =>
         messages = new
         {
             total = Num("ProcessedMessages", () => (object?)st.ProcessedMessages),
-            spam = Num("SpamMessages", () => (object?)st.SpamMessages),
-            virus = Num("VirusMessages", () => (object?)st.VirusMessages),
+            spam = Num("RemovedSpamMessages", () => (object?)st.RemovedSpamMessages),
+            virus = Num("RemovedViruses", () => (object?)st.RemovedViruses),
         },
     };
 });
@@ -640,6 +640,47 @@ api.MapDelete("/dnsbl/{id:int}", (int id) =>
     return Results.NoContent();
 });
 
+// ---------- TCP/IP ports ----------
+api.MapGet("/ports", async () =>
+{
+    dynamic col = HMail.Connect().Settings.TCPIPPorts;
+    var rows = new List<PortDto>();
+    for (int i = 0; i < (int)col.Count; i++)
+    {
+        dynamic p = col.Item[i];
+        int cert = 0;
+        try { cert = (int)p.SSLCertificateID; } catch { /* property missing on this version: show as none */ }
+        rows.Add(new PortDto((int)p.ID, (int)p.Protocol, (string)p.Address, (int)p.PortNumber, (int)p.ConnectionSecurity, cert, false));
+    }
+    var probed = await Task.WhenAll(rows.Select(async r => r with { Listening = await HMail.ProbePortAsync(r.Address, r.Port) }));
+    return Results.Ok(probed);
+});
+api.MapPost("/ports", (PortInput i) =>
+{
+    dynamic hm = HMail.Connect();
+    if (HMail.CheckPort(hm, i, null) is { } err) return HMail.Bad(err);
+    HMail.FillPort(hm.Settings.TCPIPPorts.Add(), i);
+    return Results.NoContent();
+});
+api.MapPut("/ports/{id:int}", (int id, PortInput i) =>
+{
+    dynamic hm = HMail.Connect();
+    if (HMail.CheckPort(hm, i, id) is { } err) return HMail.Bad(err);
+    dynamic? p = HMail.Find(hm.Settings.TCPIPPorts, id);
+    if (p is null) return Results.NotFound();
+    HMail.FillPort(p, i);
+    return Results.NoContent();
+});
+api.MapDelete("/ports/{id:int}", (int id) =>
+{
+    dynamic? p = HMail.Find(HMail.Connect().Settings.TCPIPPorts, id);
+    if (p is null) return Results.NotFound();
+    p.Delete();
+    return Results.NoContent();
+});
+
+// Unknown /api paths must answer 404 JSON, not the SPA's index.html (that made a missing endpoint look like a JSON parse error).
+app.MapFallback("/api/{**path}", () => Results.Problem("API này chưa có trong bridge đang chạy. Hãy thay bản HMailBridge mới nhất và khởi động lại bridge.", statusCode: 404));
 app.MapFallbackToFile("index.html");
 app.Run();
 
@@ -745,6 +786,45 @@ static class HMail
         b.ExpectedResult = i.ExpectedResult?.Trim() ?? ""; b.RejectMessage = i.RejectMessage ?? ""; b.Save();
     }
 
+    // eSessionType: SMTP=1, POP3=3, IMAP=5. eConnectionSecurity: 0 none, 1 SSL/TLS (implicit), 2 STARTTLS optional, 3 STARTTLS required.
+    public static string? CheckPort(dynamic hm, PortInput i, int? selfId)
+    {
+        if (i.Protocol is not (1 or 3 or 5)) return "Giao thức phải là SMTP, POP3 hoặc IMAP.";
+        if (i.Port is < 1 or > 65535) return "Cổng phải từ 1 đến 65535.";
+        if (!System.Net.IPAddress.TryParse(i.Address, out var addr)) return "Địa chỉ IP không hợp lệ (dùng 0.0.0.0 cho mọi địa chỉ).";
+        if (i.Security is < 0 or > 3) return "Kiểu bảo mật không hợp lệ.";
+        if (i.Security != 0 && (i.CertificateId <= 0 || Find(hm.Settings.SSLCertificates, i.CertificateId) is null))
+            return "Kiểu bảo mật này cần chọn một chứng chỉ SSL hợp lệ.";
+        dynamic col = hm.Settings.TCPIPPorts;
+        for (int k = 0; k < (int)col.Count; k++)
+        {
+            dynamic p = col.Item[k];
+            if (selfId is not null && (int)p.ID == selfId) continue;
+            if ((int)p.PortNumber != i.Port || !System.Net.IPAddress.TryParse((string)p.Address, out var other) || other.AddressFamily != addr.AddressFamily) continue;
+            bool wildcard = addr.Equals(System.Net.IPAddress.Any) || addr.Equals(System.Net.IPAddress.IPv6Any) || other.Equals(System.Net.IPAddress.Any) || other.Equals(System.Net.IPAddress.IPv6Any);
+            if (wildcard || addr.Equals(other)) return $"Cổng {i.Port} đã được dùng tại địa chỉ {(string)p.Address}; hMailServer sẽ không bind được.";
+        }
+        return null;
+    }
+    public static void FillPort(dynamic p, PortInput i)
+    {
+        p.Protocol = i.Protocol; p.Address = i.Address.Trim(); p.PortNumber = i.Port;
+        p.ConnectionSecurity = i.Security; p.SSLCertificateID = i.Security == 0 ? 0 : i.CertificateId; p.Save();
+    }
+    // Is something accepting connections on this port? Tested from the bridge, on the same machine.
+    public static async Task<bool> ProbePortAsync(string address, int port)
+    {
+        try
+        {
+            var host = address is "" or "0.0.0.0" ? "127.0.0.1" : address == "::" ? "::1" : address;
+            using var cts = new CancellationTokenSource(800);
+            using var tcp = new TcpClient();
+            await tcp.ConnectAsync(host, port, cts.Token);
+            return true;
+        }
+        catch { return false; }
+    }
+
     public static string FormatDate(object? v)
     {
         try { return Convert.ToDateTime(v).ToString("yyyy-MM-dd HH:mm"); } catch { return ""; }
@@ -783,7 +863,7 @@ sealed class SessionSampler(ILogger<SessionSampler> log) : BackgroundService
             try
             {
                 dynamic st = HMail.Connect().Status;
-                int n = (int)st.SessionCount(1) + (int)st.SessionCount(2) + (int)st.SessionCount(3); // SMTP, POP3, IMAP
+                int n = (int)st.SessionCount(1) + (int)st.SessionCount(3) + (int)st.SessionCount(5); // eSessionType: SMTP=1, POP3=3, IMAP=5
                 lock (_points) { _points.Enqueue(n); while (_points.Count > 24) _points.Dequeue(); }
             }
             catch (UnauthorizedAccessException) { /* nobody has logged in yet */ }
@@ -982,6 +1062,8 @@ static class Dnsbl
 record LiveResp(string File, long Offset, List<LogLine> Lines, string? Notice);
 record DnsblDto(int Id, string Host, bool Active, int Score, string ExpectedResult, string RejectMessage);
 record DnsblInput(string Host, bool Active, int Score, string ExpectedResult, string RejectMessage);
+record PortDto(int Id, int Protocol, string Address, int Port, int Security, int CertificateId, bool Listening);
+record PortInput(int Protocol, string Address, int Port, int Security, int CertificateId);
 record DiagRequest(string Domain, string? ServerIp, string? Selector);
 record DiagCheck(string Id, string Title, string Status, string Detail);
 record CertInfo(string? Subject, string? Issuer, string? NotAfter, int? DaysLeft, List<string> Names, bool? HostMatch, bool? KeyOk, string? Problem);
