@@ -150,14 +150,41 @@ api.MapGet("/queue/raw", () => Results.Text((string)HMail.Connect().Status.Undel
 api.MapPost("/queue/retry", () =>
 {
     dynamic q = HMail.Connect().GlobalObjects.DeliveryQueue;
-    q.ResetDeliveryTime();
+    foreach (var r in HMail.QueueRows()) q.ResetDeliveryTime(r.Id);   // ResetDeliveryTime takes a message ID
     q.StartDelivery();
     return Results.NoContent();
 });
+api.MapPost("/queue/{id:int}/retry", (int id) =>
+{
+    if (!HMail.QueueRows().Any(r => r.Id == id)) return Results.NotFound();
+    dynamic q = HMail.Connect().GlobalObjects.DeliveryQueue;
+    q.ResetDeliveryTime(id); q.StartDelivery();
+    return Results.NoContent();
+});
+// Only messages that hMailServer itself lists in the queue can be read: the file path never comes from the client.
+api.MapGet("/queue/{id:int}/source", (int id) =>
+{
+    var row = HMail.QueueRows().FirstOrDefault(r => r.Id == id);
+    if (row is null) return Results.NotFound();
+    string path = row.FileName;
+    if (!Path.IsPathRooted(path))
+    {
+        try { path = Path.Combine((string)HMail.Connect().Settings.Directories.DataDirectory, path); }
+        catch { return HMail.Bad("Không xác định được thư mục Data của hMailServer."); }
+    }
+    if (!path.EndsWith(".eml", StringComparison.OrdinalIgnoreCase) || !File.Exists(path)) return HMail.Bad($"Không tìm thấy file thư trên máy chủ: {path}");
+    using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+    var buf = new byte[Math.Min(fs.Length, 262144)];
+    fs.ReadExactly(buf);
+    return Results.Ok(new { id, source = Encoding.UTF8.GetString(buf), truncated = fs.Length > buf.Length });
+});
 
-// Removing ONE queued message is not implemented: I could not confirm a per-message COM call.
-// Check the COM reference for your version (APIs Reference) before enabling this.
-api.MapDelete("/queue/{id:int}", (int id) => Results.StatusCode(501));
+api.MapDelete("/queue/{id:int}", (int id) =>
+{
+    if (!HMail.QueueRows().Any(r => r.Id == id)) return Results.NotFound();
+    HMail.Connect().GlobalObjects.DeliveryQueue.Remove(id);   // the "Remove" action of the Administrator's queue list
+    return Results.NoContent();
+});
 
 api.MapPost("/domains", (DomainInput i) =>
 {
@@ -679,6 +706,16 @@ api.MapDelete("/ports/{id:int}", (int id) =>
     return Results.NoContent();
 });
 
+// ---------- Routes, incoming relays, SURBL servers, greylisting white list ----------
+foreach (var def in Resources.All)
+{
+    var route = "/r/" + def.Name;
+    api.MapGet(route, () => Resources.List(def));
+    api.MapPost(route, (Dictionary<string, JsonElement> body) => Resources.Save(def, null, body));
+    api.MapPut(route + "/{id:int}", (int id, Dictionary<string, JsonElement> body) => Resources.Save(def, id, body));
+    api.MapDelete(route + "/{id:int}", (int id) => Resources.Remove(def, id));
+}
+
 // Unknown /api paths must answer 404 JSON, not the SPA's index.html (that made a missing endpoint look like a JSON parse error).
 app.MapFallback("/api/{**path}", () => Results.Problem("API này chưa có trong bridge đang chạy. Hãy thay bản HMailBridge mới nhất và khởi động lại bridge.", statusCode: 404));
 app.MapFallbackToFile("index.html");
@@ -830,20 +867,17 @@ static class HMail
         try { return Convert.ToDateTime(v).ToString("yyyy-MM-dd HH:mm"); } catch { return ""; }
     }
 
-    // UndeliveredMessages is tab-separated text, one row per message. Column order is NOT confirmed:
-    // call GET /api/queue/raw once and adjust these indexes.
-    const int ColId = 0, ColFrom = 2, ColTo = 3, ColCreated = 1, ColRetries = 4;
-
-    public static List<object> QueueRows()
+    // Status.UndeliveredMessages is tab-separated, one row per message. Columns, taken from a working PowerShell
+    // script on the hMailServer forum: ID, Created, From, To, NextTry, FileName, (unknown), Tries.
+    public static List<QueueRow> QueueRows()
     {
         string raw = (string)((dynamic)Connect()).Status.UndeliveredMessages;
-        var rows = new List<object>();
+        var rows = new List<QueueRow>();
         foreach (var line in raw.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries))
         {
             var c = line.Split('\t');
             string At(int i) => i < c.Length ? c[i] : "";
-            rows.Add(new { id = int.TryParse(At(ColId), out var id) ? id : 0, from = At(ColFrom), to = At(ColTo),
-                           queuedAt = At(ColCreated), retries = int.TryParse(At(ColRetries), out var r) ? r : 0 });
+            rows.Add(new QueueRow(int.TryParse(At(0), out var id) ? id : 0, At(1), At(2), At(3), At(4), At(5), int.TryParse(At(7), out var r) ? r : 0));
         }
         return rows;
     }
@@ -999,6 +1033,12 @@ static class SettingsMap
         new("Chung", "HostName", "Tên máy chủ (host name)", "string"),
         new("Chung", "MaxMessageSize", "Kích thước thư tối đa (KB)", "int"),
         new("Chung", "RuleLoopLimit", "Giới hạn vòng lặp rule", "int"),
+        new("Giao thức", "ServiceSMTP", "Bật dịch vụ SMTP", "bool"),
+        new("Giao thức", "ServicePOP3", "Bật dịch vụ POP3", "bool"),
+        new("Giao thức", "ServiceIMAP", "Bật dịch vụ IMAP", "bool"),
+        new("Giao thức", "SMTPRelayer", "Máy chủ relay cố định (smart host)", "string"),
+        new("Giao thức", "SMTPRelayerPort", "Cổng relay cố định", "int"),
+        new("Giao thức", "SMTPDeliveryBindToIP", "Địa chỉ IP dùng khi gửi thư đi", "string"),
         new("SMTP", "WelcomeSMTP", "Lời chào SMTP", "string"),
         new("SMTP", "SMTPNoOfTries", "Số lần thử gửi", "int"),
         new("SMTP", "SMTPMinutesBetweenTry", "Phút giữa các lần thử", "int"),
@@ -1062,6 +1102,9 @@ static class Dnsbl
 record LiveResp(string File, long Offset, List<LogLine> Lines, string? Notice);
 record DnsblDto(int Id, string Host, bool Active, int Score, string ExpectedResult, string RejectMessage);
 record DnsblInput(string Host, bool Active, int Score, string ExpectedResult, string RejectMessage);
+record QueueRow(int Id, string Created, string From, string To, string NextTry, string FileName, int Retries);
+record ResField(string Json, string Com, string Type, bool WriteOnly = false);
+record ResDef(string Name, string Path, ResField[] Fields, Func<Dictionary<string, JsonElement>, string?>? Check = null);
 record PortDto(int Id, int Protocol, string Address, int Port, int Security, int CertificateId, bool Listening);
 record PortInput(int Protocol, string Address, int Port, int Security, int CertificateId);
 record DiagRequest(string Domain, string? ServerIp, string? Selector);
@@ -1229,5 +1272,104 @@ static class CertCheck
         if (string.IsNullOrWhiteSpace(host) || names.Count == 0) return null;
         return names.Any(n => string.Equals(n, host, StringComparison.OrdinalIgnoreCase) ||
             (n.StartsWith("*.") && host.Contains('.') && string.Equals(n[2..], host[(host.IndexOf('.') + 1)..], StringComparison.OrdinalIgnoreCase)));
+    }
+}
+
+// Collections under Application.Settings that share one shape: items with ID, properties, Save() and Delete().
+// Fields are whitelisted per resource; routes, relays and the white list follow the object model from memory
+// (route properties match the coax webadmin source), so a wrong name surfaces as an error on that resource only.
+static class Resources
+{
+    static string S(Dictionary<string, JsonElement> b, string k) => b.TryGetValue(k, out var v) && v.ValueKind == JsonValueKind.String ? (v.GetString() ?? "").Trim() : "";
+    static int N(Dictionary<string, JsonElement> b, string k, int d = 0) => b.TryGetValue(k, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetInt32() : d;
+    static bool HostOk(string h) => HMail.ValidDomain(h.ToLowerInvariant()) || IPAddress.TryParse(h, out _);
+
+    public static readonly ResDef[] All =
+    {
+        new("routes", "Routes", new ResField[]
+        {
+            new("domainName", "DomainName", "string"), new("description", "Description", "string"),
+            new("targetHost", "TargetSMTPHost", "string"), new("targetPort", "TargetSMTPPort", "int"),
+            new("tries", "NumberOfTries", "int"), new("minutesBetween", "MinutesBetweenTry", "int"),
+            new("senderLocal", "TreatSenderAsLocalDomain", "bool"), new("recipientLocal", "TreatRecipientAsLocalDomain", "bool"),
+            new("requiresAuth", "RelayerRequiresAuth", "bool"), new("authUser", "RelayerAuthUsername", "string"),
+            new("authPassword", "RelayerAuthPassword", "string", true), new("security", "ConnectionSecurity", "int"),
+        }, b =>
+        {
+            var d = S(b, "domainName");
+            if (d.StartsWith("*.")) d = d[2..];
+            if (!HMail.ValidDomain(d.ToLowerInvariant())) return "Tên miền route không hợp lệ (có thể dùng *.example.com).";
+            var hosts = S(b, "targetHost").Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+            if (hosts.Length == 0 || hosts.Any(h => !HostOk(h))) return "Máy chủ đích không hợp lệ (tên máy chủ hoặc IP, cách nhau bằng dấu phẩy).";
+            if (N(b, "targetPort", 25) is < 1 or > 65535) return "Cổng phải từ 1 đến 65535.";
+            if (N(b, "security") is < 0 or > 3) return "Kiểu bảo mật không hợp lệ.";
+            return null;
+        }),
+        new("relays", "IncomingRelays", new ResField[]
+        {
+            new("name", "Name", "string"), new("lowerIp", "LowerIP", "string"), new("upperIp", "UpperIP", "string"),
+        }, b =>
+            string.IsNullOrWhiteSpace(S(b, "name")) ? "Tên không được để trống."
+            : !IPAddress.TryParse(S(b, "lowerIp"), out _) || !IPAddress.TryParse(S(b, "upperIp"), out _) ? "Địa chỉ IP không hợp lệ." : null),
+        new("surbl", "AntiSpam.SURBLServers", new ResField[]
+        {
+            new("dnsHost", "DNSHost", "string"), new("score", "Score", "int"), new("rejectMessage", "RejectMessage", "string"), new("active", "Active", "bool"),
+        }, b => !HMail.ValidDomain(S(b, "dnsHost").ToLowerInvariant()) ? "Máy chủ SURBL không hợp lệ (vd. multi.surbl.org)."
+            : N(b, "score") is < 0 or > 100 ? "Điểm phải từ 0 đến 100." : null),
+        new("greywhite", "AntiSpam.GreyListingWhiteAddresses", new ResField[]
+        {
+            new("ipAddress", "IPAddress", "string"), new("description", "Description", "string"),
+        }, b => string.IsNullOrWhiteSpace(S(b, "ipAddress")) || S(b, "ipAddress").Contains(' ') ? "Hãy nhập một địa chỉ IP (không có khoảng trắng)." : null),
+    };
+
+    static dynamic Collection(ResDef d)
+    {
+        object cur = HMail.Connect().Settings;
+        foreach (var part in d.Path.Split('.')) cur = SettingsMap.Get(cur, part)!;
+        return cur;
+    }
+
+    public static IResult List(ResDef d)
+    {
+        dynamic col = Collection(d);
+        var rows = new List<Dictionary<string, object?>>();
+        for (int i = 0; i < (int)col.Count; i++)
+        {
+            object it = col.Item[i];
+            var row = new Dictionary<string, object?> { ["id"] = (int)((dynamic)it).ID };
+            foreach (var f in d.Fields.Where(f => !f.WriteOnly))
+            {
+                try { row[f.Json] = SettingsMap.Get(it, f.Com); } catch { row[f.Json] = null; }
+            }
+            rows.Add(row);
+        }
+        return Results.Ok(rows);
+    }
+
+    public static IResult Save(ResDef d, int? id, Dictionary<string, JsonElement> body)
+    {
+        if (d.Check?.Invoke(body) is { } err) return HMail.Bad(err);
+        dynamic col = Collection(d);
+        object? item = id is null ? col.Add() : HMail.Find(col, id.Value);
+        if (item is null) return Results.NotFound();
+        foreach (var f in d.Fields)
+        {
+            if (!body.TryGetValue(f.Json, out var v)) continue;
+            if (f.WriteOnly && (v.ValueKind != JsonValueKind.String || string.IsNullOrEmpty(v.GetString()))) continue;   // blank password = keep
+            object val;
+            try { val = f.Type switch { "bool" => v.GetBoolean(), "int" => v.GetInt32(), _ => v.GetString() ?? "" }; }
+            catch (Exception e) when (e is InvalidOperationException or FormatException) { return HMail.Bad($"Giá trị của {f.Json} không hợp lệ."); }
+            SettingsMap.Set(item, f.Com, val);
+        }
+        ((dynamic)item).Save();
+        return Results.NoContent();
+    }
+
+    public static IResult Remove(ResDef d, int id)
+    {
+        dynamic? item = HMail.Find(Collection(d), id);
+        if (item is null) return Results.NotFound();
+        item.Delete();
+        return Results.NoContent();
     }
 }

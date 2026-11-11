@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import { NavLink, Navigate, Route, Routes, useNavigate } from 'react-router-dom'
-import { api, auth, crud, ext, logsApi, tools, ops, more, net, type Port, type PortInput, type Dnsbl, type DiagCheck, type SslCert, type Rule, type RuleInput, type RuleCriteria, type RuleAction, type SettingRow, type SettingValue, type BlResult, type LogFile, type LogLine, type LogSummary, type Account, type Alias, type DistList, type IpRange, type SecuritySettings, type Domain, type QueueItem, type Stats } from './api'
+import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
+import { api, auth, crud, ext, logsApi, tools, ops, more, net, res, type ResItem, type Port, type PortInput, type Dnsbl, type DiagCheck, type SslCert, type Rule, type RuleInput, type RuleCriteria, type RuleAction, type SettingRow, type SettingValue, type BlResult, type LogFile, type LogLine, type LogSummary, type Account, type Alias, type DistList, type IpRange, type SecuritySettings, type Domain, type QueueItem, type Stats } from './api'
 
 function useLoad<T>(fn: () => Promise<T>) {
   const [data, setData] = useState<T>()
@@ -817,17 +817,111 @@ function Ports() {
   )
 }
 
+function ResourcePage({ title, name, help, addLabel, heads, row, fields, blank, ints = [] }: {
+  title: string; name: string; help: string; addLabel: string; heads: string[]; row: (it: ResItem) => ReactNode[]
+  fields: Field[]; blank: Values; ints?: string[]
+}) {
+  const { data, error, reload } = useLoad<ResItem[]>(() => res.list(name))
+  const [q, setQ] = useState('')
+  const [dlg, setDlg] = useState<ResItem | 'new' | null>(null)
+  const rows = (data ?? []).filter(it => JSON.stringify(it).toLowerCase().includes(q.toLowerCase()))
+  const initial = (it: ResItem): Values => Object.fromEntries(fields.map(f => [f.key,
+    f.type === 'checkbox' ? !!it[f.key] : f.type === 'select' ? String(it[f.key] ?? '') : ((it[f.key] ?? '') as string | number)]))
+  return (
+    <Page title={title} error={error}>
+      <p className="mb-4 max-w-2xl text-sm text-muted">{help}</p>
+      <Head q={q} setQ={setQ} label="Tìm kiếm" addLabel={addLabel} onAdd={() => setDlg('new')} />
+      <Table heads={[...heads, '']} empty="Chưa có mục nào."
+        rows={rows.map(it => [...row(it), <Actions key="a" onEdit={() => setDlg(it)} onDelete={() => confirmDelete('Xoá mục này?', () => res.del(name, it.id), reload)} />])} />
+      {dlg && <FormDialog title={dlg === 'new' ? addLabel : 'Sửa'} fields={fields} initial={dlg === 'new' ? blank : initial(dlg)} onClose={() => setDlg(null)}
+        onSave={async v => {
+          const body = Object.fromEntries(Object.entries(v).map(([k, x]) => [k, ints.includes(k) ? Number(x) : typeof x === 'string' ? x.trim() : x]))
+          await res.save(name, dlg === 'new' ? null : dlg.id, body); reload()
+        }} />}
+    </Page>
+  )
+}
+
+const SEC_OPTS = SECURITY
+const yes = (b: unknown) => (b ? 'Có' : 'Không')
+
+function RoutesPage() {
+  return <ResourcePage title="Routes" name="routes" addLabel="Thêm route" ints={['targetPort', 'tries', 'minutesBetween', 'security']}
+    help="Gửi thư của một tên miền thẳng tới máy chủ chỉ định thay vì tra MX (smart host, backup MX). Địa chỉ riêng lẻ của route chưa được hỗ trợ ở đây."
+    heads={['Tên miền', 'Máy chủ đích', 'Cổng', 'Bảo mật', 'Coi là local']}
+    row={r => [<b key="d">{String(r.domainName)}</b>, String(r.targetHost), String(r.targetPort), label(SEC_OPTS, String(r.security)), `gửi: ${yes(r.senderLocal)} · nhận: ${yes(r.recipientLocal)}`]}
+    blank={{ domainName: '', description: '', targetHost: '', targetPort: 25, tries: 5, minutesBetween: 60, senderLocal: false, recipientLocal: false, security: '0', requiresAuth: false, authUser: '', authPassword: '' }}
+    fields={[{ key: 'domainName', label: 'Tên miền', required: true, hint: 'Có thể dùng *.example.com' }, { key: 'description', label: 'Mô tả' },
+      { key: 'targetHost', label: 'Máy chủ đích', required: true, hint: 'Nhiều máy chủ: cách nhau bằng dấu phẩy' }, { key: 'targetPort', label: 'Cổng', type: 'number', required: true },
+      { key: 'security', label: 'Bảo mật kết nối', type: 'select', options: SEC_OPTS }, { key: 'tries', label: 'Số lần thử', type: 'number' }, { key: 'minutesBetween', label: 'Phút giữa các lần thử', type: 'number' },
+      { key: 'senderLocal', label: 'Coi người gửi khớp route là local', type: 'checkbox' }, { key: 'recipientLocal', label: 'Coi người nhận khớp route là local', type: 'checkbox' },
+      { key: 'requiresAuth', label: 'Máy chủ đích yêu cầu đăng nhập', type: 'checkbox' }, { key: 'authUser', label: 'Tên đăng nhập' },
+      { key: 'authPassword', label: 'Mật khẩu', type: 'password', hint: 'Để trống nếu không đổi. Mật khẩu không bao giờ được hiển thị lại.' }]} />
+}
+
+function RelaysPage() {
+  return <ResourcePage title="Incoming relays" name="relays" addLabel="Thêm incoming relay"
+    help="Gateway phía trước (bộ lọc thư rác, load balancer) mà địa chỉ IP của chúng không được tính là máy chủ gửi thư khi hMailServer kiểm tra chống thư rác."
+    heads={['Tên', 'Dải IP']} row={r => [<b key="n">{String(r.name)}</b>, `${r.lowerIp} – ${r.upperIp}`]}
+    blank={{ name: '', lowerIp: '', upperIp: '' }}
+    fields={[{ key: 'name', label: 'Tên', required: true }, { key: 'lowerIp', label: 'IP bắt đầu', required: true }, { key: 'upperIp', label: 'IP kết thúc', required: true }]} />
+}
+
+function SurblPage() {
+  return <ResourcePage title="SURBL servers" name="surbl" addLabel="Thêm SURBL" ints={['score']}
+    help="Danh sách chặn URL: hMailServer tra các tên miền xuất hiện trong nội dung thư; thư chứa URL bị liệt kê sẽ bị cộng điểm spam."
+    heads={['Máy chủ', 'Trạng thái', 'Điểm', 'Thông báo từ chối']} row={r => [<b key="h">{String(r.dnsHost)}</b>, <Status key="s" active={!!r.active} />, String(r.score), String(r.rejectMessage ?? '')]}
+    blank={{ dnsHost: '', score: 3, rejectMessage: 'Message contains a blacklisted URL', active: true }}
+    fields={[{ key: 'dnsHost', label: 'Máy chủ SURBL', required: true, hint: 'vd. multi.surbl.org' }, { key: 'score', label: 'Điểm cộng', type: 'number' },
+      { key: 'rejectMessage', label: 'Thông báo từ chối' }, { key: 'active', label: 'Đang bật', type: 'checkbox' }]} />
+}
+
+function GreyWhitePage() {
+  return <ResourcePage title="Greylisting whitelist" name="greywhite" addLabel="Thêm vào whitelist"
+    help="Các IP gửi thư không bị greylisting làm trì hoãn lần đầu. Chỉ có tác dụng khi greylisting đang bật (trang Chống tấn công)."
+    heads={['Địa chỉ IP', 'Mô tả']} row={r => [<b key="i">{String(r.ipAddress)}</b>, String(r.description ?? '')]}
+    blank={{ ipAddress: '', description: '' }}
+    fields={[{ key: 'ipAddress', label: 'Địa chỉ IP', required: true }, { key: 'description', label: 'Mô tả' }]} />
+}
+
 function Queue() {
   const { data, error, reload } = useLoad<QueueItem[]>(api.queue)
-  const remove = async (id: number) => {
-    if (!confirm(`Xoá thư #${id} khỏi hàng đợi?`)) return
-    await api.deleteQueueItem(id); reload()
+  const [src, setSrc] = useState<{ id: number; source: string; truncated: boolean } | null>(null)
+  const [busy, setBusy] = useState(false)
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => e.key === 'Escape' && setSrc(null)
+    addEventListener('keydown', h); return () => removeEventListener('keydown', h)
+  }, [])
+  const act = async (f: () => Promise<unknown>) => {
+    setBusy(true)
+    try { await f() } catch (e) { alert((e as Error).message) }
+    setBusy(false); reload()
   }
+  const view = async (id: number) => { try { setSrc(await api.queueSource(id)) } catch (e) { alert((e as Error).message) } }
+  const btn = 'rounded-lg border border-line px-4 py-2 text-sm hover:bg-mist disabled:opacity-50'
   return (
     <Page title="Hàng đợi gửi" error={error}>
-      <Table heads={['Mã', 'Từ', 'Đến', 'Vào hàng đợi', 'Thử lại', '']} empty="Hàng đợi trống."
-        rows={(data ?? []).map(m => [m.id, m.from, m.to, m.queuedAt, m.retries,
-          <button key="d" onClick={() => remove(m.id)} className="text-sm font-medium text-warn hover:underline">Xoá thư</button>])} />
+      <div className="mb-4 flex gap-3">
+        <button className={btn} disabled={busy} onClick={reload}>Làm mới</button>
+        <button className={btn} disabled={busy || !data?.length} onClick={() => confirm('Gửi lại ngay tất cả thư trong hàng đợi?') && act(() => api.retryQueue(null))}>Gửi lại tất cả</button>
+      </div>
+      <Table heads={['Mã', 'Tạo lúc', 'Từ', 'Đến', 'Lần thử tiếp', 'Số lần thử', '']} empty="Hàng đợi trống."
+        rows={(data ?? []).map(m => [<button key="i" onClick={() => view(m.id)} className="font-medium text-signal hover:underline">{m.id}</button>, m.created, m.from, m.to, m.nextTry, m.retries,
+          <div key="a" className="flex gap-3 text-sm font-medium">
+            <button disabled={busy} onClick={() => act(() => api.retryQueue(m.id))} className="text-signal hover:underline">Gửi ngay</button>
+            <button disabled={busy} onClick={() => confirm(`Xoá thư #${m.id} khỏi hàng đợi? Thư sẽ không được gửi nữa.`) && act(() => api.deleteQueueItem(m.id))} className="text-warn hover:underline">Xoá</button>
+          </div>])} />
+      <p className="mt-3 text-xs text-muted">Nhấn vào mã thư để xem nội dung gốc (tối đa 256 KB đầu).</p>
+      {src && (
+        <div role="dialog" aria-modal="true" aria-label={`Thư ${src.id}`} className="fixed inset-0 z-10 grid place-items-center bg-ink/50 p-4">
+          <div className="w-full max-w-3xl space-y-3 rounded-2xl bg-white p-6">
+            <h2 className="text-lg font-semibold">Thư #{src.id}</h2>
+            <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap break-all rounded-lg bg-mist p-3 text-xs">{src.source}</pre>
+            {src.truncated && <p className="text-xs text-warn">Nội dung đã bị cắt, chỉ hiện 256 KB đầu.</p>}
+            <div className="text-right"><button onClick={() => setSrc(null)} className="rounded-lg bg-ink px-4 py-2 text-sm font-medium text-white hover:bg-signal">Đóng</button></div>
+          </div>
+        </div>
+      )}
     </Page>
   )
 }
@@ -854,21 +948,71 @@ function Login() {
   )
 }
 
-const nav = [['/', 'Tổng quan'], ['/domains', 'Tên miền'], ['/accounts', 'Tài khoản'], ['/aliases', 'Alias'], ['/lists', 'Danh sách phân phối'], ['/ranges', 'IP ranges'], ['/security', 'Chống tấn công'], ['/rules', 'Rules'], ['/queue', 'Hàng đợi gửi'], ['/logs', 'Nhật ký'], ['/settings', 'Cài đặt'], ['/utilities', 'Tiện ích'], ['/diagnostics', 'Chẩn đoán'], ['/ssl', 'Chứng chỉ SSL'], ['/dnsbl', 'DNS blacklists'], ['/live', 'Live logging'], ['/ports', 'TCP/IP ports']]
+const GROUPS: { id: string; title: string; items: [string, string][] }[] = [
+  { id: 'main', title: 'Chính', items: [['/', 'Tổng quan'], ['/queue', 'Hàng đợi gửi'], ['/logs', 'Nhật ký'], ['/live', 'Live logging']] },
+  { id: 'accounts', title: 'Tên miền & tài khoản', items: [['/domains', 'Tên miền'], ['/accounts', 'Tài khoản'], ['/aliases', 'Alias'], ['/lists', 'Danh sách phân phối']] },
+  { id: 'flow', title: 'Luồng thư', items: [['/rules', 'Rules'], ['/routes', 'Routes'], ['/relays', 'Incoming relays']] },
+  { id: 'spam', title: 'Chống thư rác & tấn công', items: [['/security', 'Chống tấn công'], ['/ranges', 'IP ranges'], ['/dnsbl', 'DNS blacklists'], ['/surbl', 'SURBL'], ['/greywhite', 'Greylisting whitelist']] },
+  { id: 'net', title: 'Kết nối & bảo mật', items: [['/ports', 'TCP/IP ports'], ['/ssl', 'Chứng chỉ SSL']] },
+  { id: 'system', title: 'Hệ thống', items: [['/settings', 'Cài đặt'], ['/utilities', 'Tiện ích'], ['/diagnostics', 'Chẩn đoán']] },
+]
+
+function Sidebar() {
+  const go = useNavigate()
+  const { pathname } = useLocation()
+  const [menu, setMenu] = useState(false) // mobile: menu hidden until opened
+  const [closed, setClosed] = useState<Record<string, boolean>>(() => {
+    try { return JSON.parse(localStorage.getItem('hm_nav_closed') ?? '{}') } catch { return {} }
+  })
+  const here = (to: string) => (to === '/' ? pathname === '/' : pathname === to || pathname.startsWith(to + '/'))
+  const activeGroup = GROUPS.find(g => g.items.some(([to]) => here(to)))?.id
+  useEffect(() => {
+    setMenu(false)
+    if (activeGroup) setClosed(c => (c[activeGroup] ? { ...c, [activeGroup]: false } : c)) // opening a page reveals its group
+  }, [pathname])
+  useEffect(() => { try { localStorage.setItem('hm_nav_closed', JSON.stringify(closed)) } catch { /* storage unavailable */ } }, [closed])
+  const allClosed = GROUPS.every(g => closed[g.id])
+  return (
+    <aside className="bg-ink text-white md:sticky md:top-0 md:flex md:h-screen md:flex-col">
+      <div className="flex items-center justify-between p-3 md:p-4">
+        <p className="px-3 py-2 text-lg font-semibold">hMailAdmin</p>
+        <button aria-expanded={menu} aria-controls="main-nav" onClick={() => setMenu(!menu)} className="rounded-lg px-3 py-2 text-sm hover:bg-white/10 md:hidden">{menu ? 'Đóng' : 'Menu'}</button>
+      </div>
+      <nav id="main-nav" aria-label="Điều hướng chính" className={`${menu ? 'block' : 'hidden'} space-y-1 overflow-y-auto px-3 pb-3 md:block md:flex-1 md:px-4`}>
+        <button onClick={() => setClosed(allClosed ? {} : Object.fromEntries(GROUPS.map(g => [g.id, true])))} className="px-3 py-1 text-xs text-white/50 hover:text-white">{allClosed ? 'Mở tất cả nhóm' : 'Thu gọn tất cả'}</button>
+        {GROUPS.map(g => {
+          const open = !closed[g.id]
+          return (
+            <div key={g.id}>
+              <button onClick={() => setClosed({ ...closed, [g.id]: open })} aria-expanded={open} aria-controls={`nav-${g.id}`}
+                className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-white/55 hover:text-white">
+                <span>{g.title}{!open && g.id === activeGroup && <span aria-label="đang ở nhóm này" className="ml-2 inline-block h-1.5 w-1.5 rounded-full bg-signal align-middle" />}</span>
+                <span aria-hidden className={`transition-transform ${open ? 'rotate-90' : ''}`}>›</span>
+              </button>
+              {open && (
+                <ul id={`nav-${g.id}`} className="space-y-0.5 pb-2">
+                  {g.items.map(([to, label]) => (
+                    <li key={to}><NavLink to={to} end={to === '/'}
+                      className={({ isActive }) => `block rounded-lg px-3 py-2 text-sm ${isActive ? 'bg-signal' : 'text-white/75 hover:bg-white/10'}`}>{label}</NavLink></li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )
+        })}
+      </nav>
+      <div className={`${menu ? 'block' : 'hidden'} px-3 pb-3 md:block md:px-4 md:pb-4`}>
+        <button onClick={() => { auth.set(null); go('/login') }} className="w-full rounded-lg px-3 py-2 text-left text-sm text-white/75 hover:bg-white/10">Đăng xuất</button>
+      </div>
+    </aside>
+  )
+}
 
 function Shell() {
-  const go = useNavigate()
   if (!auth.token) return <Navigate to="/login" replace />
   return (
-    <div className="min-h-screen md:grid md:grid-cols-[14rem_1fr]">
-      <aside className="flex flex-wrap items-center gap-1 bg-ink p-3 text-white md:flex-col md:items-stretch md:p-4">
-        <p className="mr-4 px-3 py-2 text-lg font-semibold md:mb-4">hMailAdmin</p>
-        {nav.map(([to, label]) => (
-          <NavLink key={to} to={to} end={to === '/'}
-            className={({ isActive }) => `rounded-lg px-3 py-2 text-sm ${isActive ? 'bg-signal' : 'text-white/75 hover:bg-white/10'}`}>{label}</NavLink>
-        ))}
-        <button onClick={() => { auth.set(null); go('/login') }} className="rounded-lg px-3 py-2 text-left text-sm text-white/75 hover:bg-white/10 md:mt-auto">Đăng xuất</button>
-      </aside>
+    <div className="min-h-screen md:grid md:grid-cols-[15rem_1fr]">
+      <Sidebar />
       <main>
         <Routes>
           <Route index element={<Dashboard />} />
@@ -888,6 +1032,10 @@ function Shell() {
           <Route path="dnsbl" element={<Dnsbls />} />
           <Route path="live" element={<Live />} />
           <Route path="ports" element={<Ports />} />
+          <Route path="routes" element={<RoutesPage />} />
+          <Route path="relays" element={<RelaysPage />} />
+          <Route path="surbl" element={<SurblPage />} />
+          <Route path="greywhite" element={<GreyWhitePage />} />
         </Routes>
       </main>
     </div>

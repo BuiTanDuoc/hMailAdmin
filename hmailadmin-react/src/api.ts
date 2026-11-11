@@ -1,7 +1,7 @@
 export type Stats = { sessions: number[]; queue: number; messages: { total: number; spam: number; virus: number } }
 export type Domain = { id: number; name: string; active: boolean; accounts: number; quotaMb: number; usedMb: number }
 export type Account = { id: number; address: string; active: boolean; quotaMb: number; usedMb: number; lastLogon: string }
-export type QueueItem = { id: number; from: string; to: string; queuedAt: string; retries: number }
+export type QueueItem = { id: number; created: string; from: string; to: string; nextTry: string; fileName: string; retries: number }
 
 const BASE = import.meta.env.VITE_API_URL ?? '/api'
 const MOCK = import.meta.env.VITE_MOCK !== 'false' // set VITE_MOCK=false to use the real bridge
@@ -36,8 +36,8 @@ const mock = {
     { id: 3, address: 'support@adgps.vn', active: false, quotaMb: 512, usedMb: 120, lastLogon: '2026-10-02 14:17' },
   ] as Account[],
   queue: [
-    { id: 101, from: 'booking@melia-resort.vn', to: 'guest@example.com', queuedAt: '2026-11-10 09:12', retries: 2 },
-    { id: 102, from: 'kiem@adsun.vn', to: 'partner@example.org', queuedAt: '2026-11-10 09:30', retries: 0 },
+    { id: 101, from: 'booking@melia-resort.vn', to: 'guest@example.com', created: '2026-11-10 09:12', nextTry: '2026-11-10 10:30', fileName: 'C:\\\\Data\\\\{GUID}.eml', retries: 2 },
+    { id: 102, from: 'kiem@adsun.vn', to: 'partner@example.org', created: '2026-11-10 09:30', nextTry: '2026-11-10 10:30', fileName: 'C:\\\\Data\\\\{GUID}.eml', retries: 0 },
   ] as QueueItem[],
 }
 const wait = <T,>(v: T) => new Promise<T>(r => setTimeout(() => r(structuredClone(v)), 250))
@@ -55,6 +55,9 @@ export const api = {
     if (MOCK) { mock.queue = mock.queue.filter(q => q.id !== id); return wait(undefined) }
     return http<void>(`/queue/${id}`, { method: 'DELETE' })
   },
+  queueSource: (id: number) => MOCK ? wait({ id, source: 'From: a@example.com\r\nTo: b@example.com\r\nSubject: Mô phỏng\r\n\r\nNội dung thư.', truncated: false })
+    : http<{ id: number; source: string; truncated: boolean }>(`/queue/${id}/source`),
+  retryQueue: (id: number | null) => (MOCK ? wait(undefined) : http<void>(id === null ? '/queue/retry' : `/queue/${id}/retry`, { method: 'POST' })),
 }
 
 export type Alias = { id: number; name: string; value: string; active: boolean }
@@ -233,4 +236,20 @@ export const net = {
     if (id === null) portStore.push({ id: ++seq, listening: false, ...v }); else Object.assign(portStore.find(x => x.id === id)!, v)
   }) : send('/ports', id, v),
   deletePort: (id: number) => MOCK ? run(() => drop(portStore, id)) : remove('/ports', id),
+}
+
+export type ResItem = { id: number } & Record<string, string | number | boolean | null>
+const resStore: Record<string, ResItem[]> = {
+  routes: [{ id: 1, domainName: 'partner.example', description: 'Đối tác', targetHost: 'mx.partner.example', targetPort: 25, tries: 5, minutesBetween: 60, senderLocal: false, recipientLocal: false, requiresAuth: false, authUser: '', security: 2 }],
+  relays: [{ id: 1, name: 'Bộ lọc thư rác', lowerIp: '10.0.0.5', upperIp: '10.0.0.5' }],
+  surbl: [{ id: 1, dnsHost: 'multi.surbl.org', score: 3, rejectMessage: 'Message contains a blacklisted URL', active: true }],
+  greywhite: [{ id: 1, ipAddress: '203.0.113.7', description: 'Máy chủ đối tác' }],
+}
+export const res = {
+  list: (name: string) => (MOCK ? wait(resStore[name]) : http<ResItem[]>(`/r/${name}`)),
+  save: (name: string, id: number | null, v: Record<string, unknown>) => MOCK ? run(() => {
+    if (id === null) resStore[name].push({ id: ++seq, ...(v as Record<string, string | number | boolean | null>) })
+    else Object.assign(resStore[name].find(x => x.id === id)!, v)
+  }) : send(`/r/${name}`, id, v),
+  del: (name: string, id: number) => (MOCK ? run(() => drop(resStore[name], id)) : remove(`/r/${name}`, id)),
 }
