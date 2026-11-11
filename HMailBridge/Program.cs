@@ -579,6 +579,67 @@ api.MapDelete("/ssl/{id:int}", (int id) =>
     return Results.NoContent();
 });
 
+// ---------- Live logging: tail today's log file ----------
+// Registered before /logs/{name}/... routes by being a distinct path (/logs/live).
+api.MapGet("/logs/live", (string? file, long? offset, IConfiguration cfg) =>
+{
+    var cur = $"hmailserver_{DateTime.Now:yyyy-MM-dd}.log";
+    var path = Path.Combine(LogStore.Dir(cfg), cur);
+    if (!File.Exists(path))
+        return Results.Ok(new LiveResp(cur, 0, new List<LogLine>(), "Chưa có file log hôm nay. Kiểm tra ghi log đã bật trong Cài đặt."));
+    using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+    bool resume = file == cur && offset is >= 0 && offset <= fs.Length;   // otherwise: first call, new day, or file truncated
+    long start = resume ? offset!.Value : Math.Max(0, fs.Length - 65536);
+    int len = (int)Math.Min(fs.Length - start, 262144);
+    var buf = new byte[len];
+    fs.Seek(start, SeekOrigin.Begin);
+    fs.ReadExactly(buf);
+    int end = Array.LastIndexOf(buf, (byte)'\n');
+    if (end < 0) return Results.Ok(new LiveResp(cur, len == 262144 ? start + len : start, new List<LogLine>(), null));   // no complete line yet (or one huge line: skip it)
+    int begin = 0;
+    if (!resume && start > 0) begin = Array.IndexOf(buf, (byte)'\n') + 1;   // drop the partial first line
+    var text = Encoding.UTF8.GetString(buf, begin, Math.Max(0, end + 1 - begin));
+    var lines = text.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+        .Select(x => LogStore.ParseLine(x.TrimEnd('\r'))).Where(x => x is not null).Select(x => x!).ToList();
+    if (!resume && lines.Count > 100) lines = lines.GetRange(lines.Count - 100, 100);
+    return Results.Ok(new LiveResp(cur, start + end + 1, lines, null));
+});
+
+// ---------- DNS blacklists (anti-spam) ----------
+api.MapGet("/dnsbl", () =>
+{
+    dynamic col = HMail.Connect().Settings.AntiSpam.DNSBlackLists;
+    var list = new List<DnsblDto>();
+    for (int i = 0; i < (int)col.Count; i++)
+    {
+        dynamic b = col.Item[i];
+        list.Add(new DnsblDto((int)b.ID, (string)b.DNSHost, (bool)b.Active, (int)b.Score, (string)b.ExpectedResult, (string)b.RejectMessage));
+    }
+    return list;
+});
+api.MapPost("/dnsbl", (DnsblInput i) =>
+{
+    if (HMail.CheckDnsbl(i) is { } err) return HMail.Bad(err);
+    dynamic b = HMail.Connect().Settings.AntiSpam.DNSBlackLists.Add();
+    HMail.FillDnsbl(b, i);
+    return Results.NoContent();
+});
+api.MapPut("/dnsbl/{id:int}", (int id, DnsblInput i) =>
+{
+    if (HMail.CheckDnsbl(i) is { } err) return HMail.Bad(err);
+    dynamic? b = HMail.Find(HMail.Connect().Settings.AntiSpam.DNSBlackLists, id);
+    if (b is null) return Results.NotFound();
+    HMail.FillDnsbl(b, i);
+    return Results.NoContent();
+});
+api.MapDelete("/dnsbl/{id:int}", (int id) =>
+{
+    dynamic? b = HMail.Find(HMail.Connect().Settings.AntiSpam.DNSBlackLists, id);
+    if (b is null) return Results.NotFound();
+    b.Delete();
+    return Results.NoContent();
+});
+
 app.MapFallbackToFile("index.html");
 app.Run();
 
@@ -671,6 +732,19 @@ static class HMail
         r.AllowSMTPConnections = i.AllowSmtp; r.AllowPOP3Connections = i.AllowPop; r.AllowIMAPConnections = i.AllowImap;
     }
 
+    public static string? CheckDnsbl(DnsblInput i)
+    {
+        if (!ValidDomain(i.Host?.Trim().ToLowerInvariant())) return "Tên máy chủ DNSBL không hợp lệ (vd. zen.spamhaus.org).";
+        if (i.Score < 0 || i.Score > 100) return "Điểm phải từ 0 đến 100.";
+        if (!string.IsNullOrWhiteSpace(i.ExpectedResult) && !System.Net.IPAddress.TryParse(i.ExpectedResult, out _)) return "Kết quả mong đợi phải là một địa chỉ IP (vd. 127.0.0.2) hoặc để trống.";
+        return null;
+    }
+    public static void FillDnsbl(dynamic b, DnsblInput i)
+    {
+        b.DNSHost = i.Host.Trim().ToLowerInvariant(); b.Active = i.Active; b.Score = i.Score;
+        b.ExpectedResult = i.ExpectedResult?.Trim() ?? ""; b.RejectMessage = i.RejectMessage ?? ""; b.Save();
+    }
+
     public static string FormatDate(object? v)
     {
         try { return Convert.ToDateTime(v).ToString("yyyy-MM-dd HH:mm"); } catch { return ""; }
@@ -742,6 +816,16 @@ static class LogStore
         l.Type is "SMTPD" or "POP3D" or "IMAPD" && l.Message.StartsWith("SENT:") &&
         (l.Message.Contains("Invalid user name or password") || l.Message.Contains("Authentication failed"));
 
+    public static LogLine? ParseLine(string line)
+    {
+        var p = line.Split('\t');
+        if (p.Length < 4) return null;
+        for (int i = 0; i < p.Length; i++) p[i] = p[i].Trim('"');
+        if (p[0] is "SMTPD" or "POP3D" or "IMAPD" or "SMTPC" && p.Length >= 6)
+            return new LogLine(p[0], p[3], p[4], string.Join(' ', p.Skip(5)));
+        return new LogLine(p[0], p[2], null, string.Join(' ', p.Skip(3)));
+    }
+
     public static IEnumerable<LogLine> Read(string path)
     {
         // hMailServer keeps writing to today's file, so open it with shared access.
@@ -750,13 +834,8 @@ static class LogStore
         string? line;
         while ((line = sr.ReadLine()) is not null)
         {
-            var p = line.Split('\t');
-            if (p.Length < 4) continue;
-            for (int i = 0; i < p.Length; i++) p[i] = p[i].Trim('"');
-            if (p[0] is "SMTPD" or "POP3D" or "IMAPD" or "SMTPC" && p.Length >= 6)
-                yield return new LogLine(p[0], p[3], p[4], string.Join(' ', p.Skip(5)));
-            else
-                yield return new LogLine(p[0], p[2], null, string.Join(' ', p.Skip(3)));
+            var l = ParseLine(line);
+            if (l is not null) yield return l;
         }
     }
 }
@@ -900,6 +979,9 @@ static class Dnsbl
     }
 }
 
+record LiveResp(string File, long Offset, List<LogLine> Lines, string? Notice);
+record DnsblDto(int Id, string Host, bool Active, int Score, string ExpectedResult, string RejectMessage);
+record DnsblInput(string Host, bool Active, int Score, string ExpectedResult, string RejectMessage);
 record DiagRequest(string Domain, string? ServerIp, string? Selector);
 record DiagCheck(string Id, string Title, string Status, string Detail);
 record CertInfo(string? Subject, string? Issuer, string? NotAfter, int? DaysLeft, List<string> Names, bool? HostMatch, bool? KeyOk, string? Problem);

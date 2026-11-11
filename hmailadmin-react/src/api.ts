@@ -198,3 +198,21 @@ export const ops = {
   }) : send('/ssl', id, v),
   deleteCert: (id: number) => MOCK ? run(() => drop(certStore, id)) : remove('/ssl', id),
 }
+
+export type LiveResp = { file: string; offset: number; lines: LogLine[]; notice: string | null }
+export type Dnsbl = { id: number; host: string; active: boolean; score: number; expectedResult: string; rejectMessage: string }
+export type DnsblInput = Omit<Dnsbl, 'id'>
+
+const dnsblStore: Dnsbl[] = [{ id: 1, host: 'zen.spamhaus.org', active: true, score: 5, expectedResult: '127.0.0.2', rejectMessage: 'Rejected by DNS blacklist' }]
+
+export const more = {
+  live: (file: string, offset: number | null) => MOCK ? wait<LiveResp>({
+    file: 'hmailserver_mock.log', offset: (offset ?? 0) + 1, notice: null,
+    lines: [{ type: 'SMTPD', time: new Date().toISOString().slice(11, 23), ip: '203.0.113.5', message: 'RECEIVED: EHLO example.com' }],
+  }) : http<LiveResp>(`/logs/live?${qs({ file, offset: offset === null ? '' : String(offset) })}`),
+  dnsbl: () => (MOCK ? wait(dnsblStore) : http<Dnsbl[]>('/dnsbl')),
+  saveDnsbl: (id: number | null, v: DnsblInput) => MOCK ? run(() => {
+    if (id === null) dnsblStore.push({ id: ++seq, ...v }); else Object.assign(dnsblStore.find(x => x.id === id)!, v)
+  }) : send('/dnsbl', id, v),
+  deleteDnsbl: (id: number) => MOCK ? run(() => drop(dnsblStore, id)) : remove('/dnsbl', id),
+}

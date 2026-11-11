@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { NavLink, Navigate, Route, Routes, useNavigate } from 'react-router-dom'
-import { api, auth, crud, ext, logsApi, tools, ops, type DiagCheck, type SslCert, type Rule, type RuleInput, type RuleCriteria, type RuleAction, type SettingRow, type SettingValue, type BlResult, type LogFile, type LogLine, type LogSummary, type Account, type Alias, type DistList, type IpRange, type SecuritySettings, type Domain, type QueueItem, type Stats } from './api'
+import { api, auth, crud, ext, logsApi, tools, ops, more, type Dnsbl, type DiagCheck, type SslCert, type Rule, type RuleInput, type RuleCriteria, type RuleAction, type SettingRow, type SettingValue, type BlResult, type LogFile, type LogLine, type LogSummary, type Account, type Alias, type DistList, type IpRange, type SecuritySettings, type Domain, type QueueItem, type Stats } from './api'
 
 function useLoad<T>(fn: () => Promise<T>) {
   const [data, setData] = useState<T>()
@@ -688,6 +688,89 @@ function Ssl() {
   )
 }
 
+function Dnsbls() {
+  const { data, error, reload } = useLoad<Dnsbl[]>(more.dnsbl)
+  const [q, setQ] = useState('')
+  const [dlg, setDlg] = useState<Dnsbl | 'new' | null>(null)
+  const rows = (data ?? []).filter(b => b.host.includes(q.toLowerCase()))
+  return (
+    <Page title="DNS blacklists" error={error}>
+      <p className="mb-4 max-w-2xl text-sm text-muted">Khi IP gửi thư nằm trong một danh sách đang bật, thư được cộng điểm spam. Tổng điểm so với ngưỡng đánh dấu/xoá thư rác trong trang Cài đặt.</p>
+      <Head q={q} setQ={setQ} label="Tìm máy chủ DNSBL" addLabel="Thêm DNSBL" onAdd={() => setDlg('new')} />
+      <Table heads={['Máy chủ DNSBL', 'Trạng thái', 'Điểm', 'Kết quả mong đợi', 'Thông báo từ chối', '']} empty="Chưa có DNS blacklist nào."
+        rows={rows.map(b => [<b key="n">{b.host}</b>, <Status key="s" active={b.active} />, b.score, b.expectedResult || 'bất kỳ', b.rejectMessage,
+          <Actions key="a" onEdit={() => setDlg(b)} onDelete={() => confirmDelete(`Xoá ${b.host}?`, () => more.deleteDnsbl(b.id), reload)} />])} />
+      {dlg && <FormDialog title={dlg === 'new' ? 'Thêm DNS blacklist' : `Sửa ${dlg.host}`} onClose={() => setDlg(null)}
+        fields={[{ key: 'host', label: 'Máy chủ DNSBL', required: true, hint: 'vd. zen.spamhaus.org' },
+          { key: 'score', label: 'Điểm cộng khi bị liệt kê', type: 'number' },
+          { key: 'expectedResult', label: 'Kết quả mong đợi', hint: 'vd. 127.0.0.2; để trống nếu mọi kết quả đều tính là bị liệt kê' },
+          { key: 'rejectMessage', label: 'Thông báo từ chối' }, { key: 'active', label: 'Đang bật', type: 'checkbox' }]}
+        initial={dlg === 'new' ? { host: '', score: 5, expectedResult: '127.0.0.2', rejectMessage: 'Rejected by DNS blacklist', active: true }
+          : { host: dlg.host, score: dlg.score, expectedResult: dlg.expectedResult, rejectMessage: dlg.rejectMessage, active: dlg.active }}
+        onSave={async v => { await more.saveDnsbl(dlg === 'new' ? null : dlg.id, { host: String(v.host), score: Number(v.score), expectedResult: String(v.expectedResult), rejectMessage: String(v.rejectMessage), active: !!v.active }); reload() }} />}
+    </Page>
+  )
+}
+
+function Live() {
+  const [running, setRunning] = useState(false)
+  const [lines, setLines] = useState<LogLine[]>([])
+  const [filter, setFilter] = useState('')
+  const [type, setType] = useState('')
+  const [follow, setFollow] = useState(true)
+  const [err, setErr] = useState('')
+  const cur = useRef<{ file: string; offset: number | null }>({ file: '', offset: null })
+  const box = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!running) return
+    let stop = false, busy = false
+    const tick = async () => {
+      if (busy) return
+      busy = true
+      try {
+        const r = await more.live(cur.current.file, cur.current.offset)
+        if (stop) return
+        cur.current = { file: r.file, offset: r.offset }
+        if (r.lines.length) setLines(prev => [...prev, ...r.lines].slice(-500))
+        setErr(r.notice ?? '')
+      } catch (e) { if (!stop) setErr((e as Error).message) }
+      finally { busy = false }
+    }
+    tick()
+    const t = setInterval(tick, 2000)
+    return () => { stop = true; clearInterval(t) }
+  }, [running])
+  useEffect(() => { if (follow && box.current) box.current.scrollTop = box.current.scrollHeight }, [lines, follow, filter, type])
+  const shown = lines.filter(l => (!type || l.type === type) && (!filter || (l.message + (l.ip ?? '')).toLowerCase().includes(filter.toLowerCase())))
+  const types = [...new Set(lines.map(l => l.type))]
+  const f = 'rounded-lg border border-line bg-white px-3 py-2 text-sm'
+  return (
+    <Page title="Live logging">
+      <div className="mb-4 flex flex-wrap items-center gap-3">
+        <button onClick={() => { if (running) setRunning(false); else { cur.current = { file: '', offset: null }; setRunning(true) } }}
+          className="rounded-lg bg-ink px-4 py-2 text-sm font-medium text-white hover:bg-signal">{running ? 'Dừng' : 'Bắt đầu'}</button>
+        <input aria-label="Lọc" placeholder="Lọc theo từ khoá hoặc IP" value={filter} onChange={e => setFilter(e.target.value)} className={f} />
+        <select aria-label="Loại" value={type} onChange={e => setType(e.target.value)} className={f}>
+          <option value="">Mọi loại</option>{types.map(t => <option key={t}>{t}</option>)}
+        </select>
+        <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={follow} onChange={e => setFollow(e.target.checked)} />Tự cuộn</label>
+        <button onClick={() => setLines([])} className="text-sm text-signal hover:underline">Xoá màn hình</button>
+        <span role="status" className="text-sm text-muted">{running ? 'Đang theo dõi (2 giây/lần)' : 'Đã dừng'} · {shown.length}/{lines.length} dòng</span>
+      </div>
+      {err && <p role="alert" className="mb-3 text-sm text-warn">{err}</p>}
+      <div ref={box} role="log" aria-label="Log trực tiếp" className="h-[60vh] overflow-auto rounded-xl border border-line bg-white p-3 font-mono text-xs leading-5">
+        {shown.length === 0 && <p className="text-muted">{running ? 'Đang chờ dòng log mới…' : 'Nhấn Bắt đầu để xem log trực tiếp.'}</p>}
+        {shown.map((l, i) => (
+          <div key={i} className={`break-all ${l.type === 'ERROR' ? 'font-medium text-warn' : ''}`}>
+            <span className="text-muted">{l.time}</span> <b>{l.type}</b> {l.ip && <span className="text-signal">{l.ip}</span>} {l.message}
+          </div>
+        ))}
+      </div>
+      <p className="mt-3 max-w-2xl text-xs text-muted">Đọc trực tiếp từ file log của hôm nay, nên chỉ thấy những loại log đã bật trong Cài đặt → Nhật ký. Giữ tối đa 500 dòng gần nhất trên màn hình.</p>
+    </Page>
+  )
+}
+
 function Queue() {
   const { data, error, reload } = useLoad<QueueItem[]>(api.queue)
   const remove = async (id: number) => {
@@ -725,7 +808,7 @@ function Login() {
   )
 }
 
-const nav = [['/', 'Tổng quan'], ['/domains', 'Tên miền'], ['/accounts', 'Tài khoản'], ['/aliases', 'Alias'], ['/lists', 'Danh sách phân phối'], ['/ranges', 'IP ranges'], ['/security', 'Chống tấn công'], ['/rules', 'Rules'], ['/queue', 'Hàng đợi gửi'], ['/logs', 'Nhật ký'], ['/settings', 'Cài đặt'], ['/utilities', 'Tiện ích'], ['/diagnostics', 'Chẩn đoán'], ['/ssl', 'Chứng chỉ SSL']]
+const nav = [['/', 'Tổng quan'], ['/domains', 'Tên miền'], ['/accounts', 'Tài khoản'], ['/aliases', 'Alias'], ['/lists', 'Danh sách phân phối'], ['/ranges', 'IP ranges'], ['/security', 'Chống tấn công'], ['/rules', 'Rules'], ['/queue', 'Hàng đợi gửi'], ['/logs', 'Nhật ký'], ['/settings', 'Cài đặt'], ['/utilities', 'Tiện ích'], ['/diagnostics', 'Chẩn đoán'], ['/ssl', 'Chứng chỉ SSL'], ['/dnsbl', 'DNS blacklists'], ['/live', 'Live logging']]
 
 function Shell() {
   const go = useNavigate()
@@ -756,6 +839,8 @@ function Shell() {
           <Route path="utilities" element={<Utilities />} />
           <Route path="diagnostics" element={<Diagnostics />} />
           <Route path="ssl" element={<Ssl />} />
+          <Route path="dnsbl" element={<Dnsbls />} />
+          <Route path="live" element={<Live />} />
         </Routes>
       </main>
     </div>
