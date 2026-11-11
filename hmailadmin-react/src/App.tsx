@@ -31,7 +31,7 @@ function Status({ active }: { active: boolean }) {
 
 function Page({ title, children, error }: { title: string; children: ReactNode; error?: string }) {
   return (
-    <section className="mx-auto max-w-5xl p-4 md:p-8">
+    <section className="w-full p-4 md:p-8">
       <h1 className="mb-6 text-2xl font-semibold tracking-tight">{title}</h1>
       {error ? <p role="alert" className="rounded-lg border border-warn p-4 text-sm">Không tải được dữ liệu: {error}. Kiểm tra API rồi thử lại.</p> : children}
     </section>
@@ -51,7 +51,7 @@ function Table({ heads, rows, empty }: { heads: string[]; rows: ReactNode[][]; e
       <div className="overflow-x-auto">
         <table className="w-full text-left text-sm">
           <thead className="border-b border-line text-muted">
-            <tr>{heads.map(h => <th key={h} className="px-4 py-3 font-medium">{h}</th>)}</tr>
+            <tr>{heads.map(h => <th key={h} className="whitespace-nowrap px-4 py-3 font-medium">{h}</th>)}</tr>
           </thead>
           <tbody>
             {rows.length === 0 && <tr><td colSpan={heads.length} className="px-4 py-8 text-center text-muted">{empty}</td></tr>}
@@ -191,7 +191,7 @@ function Head({ q, setQ, label, onAdd, addLabel, extra }: { q: string; setQ: (v:
 
 function Actions({ onEdit, onDelete }: { onEdit: () => void; onDelete: () => void }) {
   return (
-    <div className="flex gap-3 text-sm font-medium">
+    <div className="flex gap-3 whitespace-nowrap text-sm font-medium">
       <button onClick={onEdit} className="text-signal hover:underline">Sửa</button>
       <button onClick={onDelete} className="text-warn hover:underline">Xoá</button>
     </div>
@@ -393,7 +393,7 @@ function Logs() {
             <div><h2 className="mb-3 font-semibold">Đăng nhập thất bại theo IP</h2>
               <Table heads={['IP', 'Giao thức', 'Số lần', 'Lần cuối', '']} empty=""
                 rows={sum.failedLogins.map(x => [x.ip, x.protocol, x.count, x.last,
-                  <div key="a" className="flex gap-3 text-sm font-medium">
+                  <div key="a" className="flex gap-3 whitespace-nowrap text-sm font-medium">
                     <button onClick={() => look(x.ip)} className="text-signal hover:underline">Xem log</button>
                     <button onClick={() => block(x.ip)} className="text-warn hover:underline">Chặn</button>
                   </div>])} /></div>
@@ -516,7 +516,7 @@ function Rules() {
         rows={rows.map((r, i) => [i + 1, <b key="n">{r.name}</b>,
           r.supported ? `${r.criteria.length} điều kiện → ${r.actions.map(a => label(ACTS, a.type)).join(', ')}` : <span key="u" className="text-warn">Có điều kiện hoặc hành động chưa hỗ trợ</span>,
           <button key="s" onClick={() => toggle(r)} disabled={!r.supported} className="disabled:opacity-60"><Status active={r.active} /></button>,
-          <div key="a" className="flex gap-3 text-sm font-medium">
+          <div key="a" className="flex gap-3 whitespace-nowrap text-sm font-medium">
             <button aria-label="Lên" onClick={() => move(r.id, 'up')} disabled={i === 0} className="text-muted disabled:opacity-30">↑</button>
             <button aria-label="Xuống" onClick={() => move(r.id, 'down')} disabled={i === rows.length - 1} className="text-muted disabled:opacity-30">↓</button>
             <button onClick={() => setDlg(r)} disabled={!r.supported} className="text-signal hover:underline disabled:opacity-40">Sửa</button>
@@ -907,7 +907,7 @@ function Queue() {
       </div>
       <Table heads={['Mã', 'Tạo lúc', 'Từ', 'Đến', 'Lần thử tiếp', 'Số lần thử', '']} empty="Hàng đợi trống."
         rows={(data ?? []).map(m => [<button key="i" onClick={() => view(m.id)} className="font-medium text-signal hover:underline">{m.id}</button>, m.created, m.from, m.to, m.nextTry, m.retries,
-          <div key="a" className="flex gap-3 text-sm font-medium">
+          <div key="a" className="flex gap-3 whitespace-nowrap text-sm font-medium">
             <button disabled={busy} onClick={() => act(() => api.retryQueue(m.id))} className="text-signal hover:underline">Gửi ngay</button>
             <button disabled={busy} onClick={() => confirm(`Xoá thư #${m.id} khỏi hàng đợi? Thư sẽ không được gửi nữa.`) && act(() => api.deleteQueueItem(m.id))} className="text-warn hover:underline">Xoá</button>
           </div>])} />
@@ -1011,7 +1011,7 @@ function Sidebar() {
 function Shell() {
   if (!auth.token) return <Navigate to="/login" replace />
   return (
-    <div className="min-h-screen md:grid md:grid-cols-[15rem_1fr]">
+    <div className="min-h-screen md:grid md:grid-cols-[20rem_1fr]">
       <Sidebar />
       <main>
         <Routes>
