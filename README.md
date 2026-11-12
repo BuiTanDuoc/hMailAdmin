@@ -162,7 +162,7 @@ nssm start HMailBridge
 
 ### 6.5 Đặt HTTPS phía trước
 
-Không mở cổng 5080 ra Internet. Cho một reverse proxy nhận HTTPS ở cổng 443 rồi chuyển về `http://127.0.0.1:5080`.
+Không mở cổng 5080 ra Internet. Cho một reverse proxy nhận HTTPS ở cổng 443 rồi chuyển về `http://127.0.0.1:5080`. Hướng dẫn đầy đủ để công khai ra Internet với tên miền riêng và chứng chỉ SSL (Let's Encrypt) nằm ở [6.8](#68-công-khai-ra-internet-với-tên-miền-riêng-và-https).
 
 **nginx:**
 
@@ -204,6 +204,124 @@ nssm start HMailBridge
 
 Sau đó đăng nhập lại. Giao diện mới chỉ cần chép lại `dist\*` vào `wwwroot`; bridge không cần khởi động lại nếu `Program.cs` không đổi.
 
+### 6.8 Công khai ra Internet với tên miền riêng và HTTPS
+
+Mục tiêu: mở `https://admin.tenmien.vn` từ bên ngoài, chứng chỉ SSL cấp **riêng cho tên miền đó**, còn bridge vẫn chỉ nghe ở `127.0.0.1:5080`. Thứ tự: DNS → mạng/tường lửa → reverse proxy kèm chứng chỉ → kiểm tra → siết bảo mật.
+
+> **Trước khi công khai:** bridge có toàn quyền quản trị hMailServer. Hãy dùng bản bridge có giới hạn đăng nhập **theo từng IP**, mật khẩu `Administrator` dài và duy nhất, và ưu tiên hạn chế IP truy cập hoặc chỉ cho vào qua VPN (bước 6).
+
+**Bước 1. Chọn tên miền phụ và trỏ DNS**
+
+Dùng một tên riêng, ví dụ `admin.tenmien.vn` (không dùng chung `mail.tenmien.vn` của mail server). Tại nhà cung cấp DNS tạo bản ghi:
+
+| Loại | Tên | Giá trị |
+|---|---|---|
+| A | `admin` | IP công khai của máy chủ |
+| AAAA | `admin` | IPv6 công khai (chỉ khi máy chủ thật sự có và đã mở IPv6) |
+
+Kiểm tra: `nslookup admin.tenmien.vn` phải trả về đúng IP. Nếu IP công khai của bạn thay đổi, dùng DDNS hoặc IP tĩnh.
+
+**Bước 2. Mở cổng 80 và 443, không mở 5080**
+
+- Trên router/NAT hoặc firewall của nhà cung cấp máy chủ: chuyển tiếp TCP **80** và **443** về máy chủ. Cổng 80 cần để cấp chứng chỉ Let's Encrypt (HTTP-01) và chuyển hướng sang HTTPS.
+- Trên Windows Firewall:
+
+```powershell
+New-NetFirewallRule -DisplayName "Web 80 (ACME + redirect)" -Direction Inbound -Protocol TCP -LocalPort 80 -Action Allow
+New-NetFirewallRule -DisplayName "Web 443 (hMailAdmin)" -Direction Inbound -Protocol TCP -LocalPort 443 -Action Allow
+```
+
+- Kiểm tra cổng 80/443 chưa bị chiếm: `netstat -ano | findstr ":80 :443"`. IIS Default Web Site hoặc dịch vụ khác đang giữ cổng thì phải dừng hoặc chuyển.
+- Một số nhà mạng gia đình chặn 80/443. Khi đó dùng cổng khác kèm xác thực DNS-01, hoặc Cloudflare Tunnel (không cần mở cổng vào).
+
+**Bước 3. Cài reverse proxy có chứng chỉ SSL theo tên miền**
+
+Chọn **một** trong hai cách. Cách A ít bước nhất.
+
+*Cách A: Caddy (tự xin và tự gia hạn chứng chỉ Let's Encrypt)*
+
+1. Tải `caddy_windows_amd64.exe` từ caddyserver.com, đặt vào `C:\caddy\caddy.exe`.
+2. Tạo `C:\caddy\Caddyfile`:
+
+```
+admin.tenmien.vn {
+    encode gzip
+    reverse_proxy 127.0.0.1:5080
+    header {
+        -Server
+    }
+}
+```
+
+3. Chạy thử: `C:\caddy\caddy.exe run --config C:\caddy\Caddyfile`. Lần đầu Caddy tự xin chứng chỉ cho đúng tên `admin.tenmien.vn`, tự chuyển HTTP sang HTTPS và gia hạn trước khi hết hạn.
+4. Chạy nền bằng NSSM:
+
+```powershell
+nssm install Caddy "C:\caddy\caddy.exe" run --config C:\caddy\Caddyfile
+nssm set Caddy AppDirectory C:\caddy
+nssm start Caddy
+```
+
+Caddy lưu chứng chỉ trong thư mục dữ liệu của tài khoản chạy dịch vụ; nên sao lưu thư mục đó.
+
+*Cách B: IIS + win-acme (nếu máy đã dùng IIS)*
+
+1. Cài IIS, *URL Rewrite* và *Application Request Routing*; trong ARR chọn **Enable proxy**.
+2. Tạo site, binding HTTP cổng 80 với host name `admin.tenmien.vn`, thư mục bất kỳ.
+3. Trong `web.config` của site:
+
+```xml
+<configuration>
+  <system.webServer>
+    <rewrite>
+      <rules>
+        <rule name="HTTPS redirect" stopProcessing="true">
+          <match url="(.*)" />
+          <conditions><add input="{HTTPS}" pattern="off" /></conditions>
+          <action type="Redirect" url="https://{HTTP_HOST}/{R:1}" redirectType="Permanent" />
+        </rule>
+        <rule name="Proxy to bridge" stopProcessing="true">
+          <match url="(.*)" />
+          <action type="Rewrite" url="http://127.0.0.1:5080/{R:1}" />
+        </rule>
+      </rules>
+    </rewrite>
+  </system.webServer>
+</configuration>
+```
+
+4. Chạy [win-acme](https://www.win-acme.com/) (`wacs.exe`), chọn tạo chứng chỉ cho binding IIS của `admin.tenmien.vn`. Công cụ tự tạo binding HTTPS và đặt tác vụ gia hạn tự động.
+
+*Dùng chứng chỉ có sẵn (wildcard hoặc thương mại)*: chứng chỉ phải có tên `admin.tenmien.vn` hoặc `*.tenmien.vn` trong SAN. Chứng chỉ của mail server (ví dụ chỉ có `mail.tenmien.vn`) **không dùng được**, trình duyệt sẽ báo sai tên. Trang **Chứng chỉ SSL** trong ứng dụng chỉ quản lý chứng chỉ của hMailServer, không phải chứng chỉ của web này.
+
+**Bước 4. Giữ bridge chỉ nghe nội bộ**
+
+Giữ `"Urls": "http://127.0.0.1:5080"`. Reverse proxy nằm cùng máy nên bridge tin tiêu đề `X-Forwarded-For` từ chính proxy và dùng IP thật của người dùng để giới hạn đăng nhập (5 lần/phút cho mỗi IP). Chỉ bridge bản mới mới có hành vi này.
+
+**Bước 5. Kiểm tra từ bên ngoài**
+
+Dùng điện thoại với 4G, hoặc máy ở mạng khác:
+
+1. Mở `https://admin.tenmien.vn`: khoá hợp lệ, đúng tên miền, đăng nhập được.
+2. Mở `http://admin.tenmien.vn`: tự chuyển sang HTTPS.
+3. `Test-NetConnection <IP-công-khai> -Port 5080` phải **không** kết nối được.
+4. Thử sai mật khẩu 6 lần liên tiếp: lần thứ 6 phải bị chặn (429) và chỉ chặn IP đó.
+5. Kiểm tra cấu hình TLS, ví dụ bằng SSL Labs; xác nhận lịch gia hạn chứng chỉ (Caddy tự lo; win-acme tạo tác vụ trong Task Scheduler).
+
+**Bước 6. Siết bảo mật (nên làm)**
+
+- **Hạn chế IP:** chỉ cho dải IP của người quản trị vào cổng 443.
+
+```powershell
+Set-NetFirewallRule -DisplayName "Web 443 (hMailAdmin)" -RemoteAddress 203.0.113.10,198.51.100.0/24
+```
+
+  Giữ cổng 80 mở cho mọi nơi để cấp/gia hạn chứng chỉ (nội dung duy nhất cổng 80 phục vụ là xác thực và chuyển hướng). Với Caddy, có thể chặn ở tầng ứng dụng bằng `@blocked not remote_ip ...` rồi `respond @blocked 403`.
+- **VPN hoặc lớp xác thực bên ngoài:** đặt VPN (WireGuard, OpenVPN) hoặc Cloudflare Access trước giao diện nếu có thể. Đây là biện pháp mạnh hơn mọi cách chặn bằng mật khẩu.
+- **HSTS:** sau khi chắc chắn HTTPS chạy ổn, thêm header `Strict-Transport-Security: max-age=31536000` ở proxy (Caddy: trong khối `header`).
+- Bridge đã tự thêm các header `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy` và `Content-Security-Policy`. Nếu bạn thêm tài nguyên bên ngoài vào giao diện, cần sửa CSP trong `Program.cs`.
+- Theo dõi log của proxy và dòng `warn: Login '...' refused` của bridge để phát hiện dò mật khẩu; dùng trang **Nhật ký** để chặn IP nguồn nếu cần.
+
 ## 7. Cấu hình
 
 | Tên | Nơi đặt | Mặc định | Ý nghĩa |
@@ -219,9 +337,9 @@ Khi chạy `npm run dev`, Vite chuyển `/api` tới `http://localhost:5080` (xe
 ## 8. Bảo mật
 
 - Bridge dùng thông tin đăng nhập admin giữ trong **bộ nhớ**; không có tệp nào chứa mật khẩu. Khoá JWT chỉ nằm trong biến môi trường.
-- Chỉ tài khoản **Administrator** hoặc tài khoản email có `AdminLevel = 2` mới đăng nhập được. Đăng nhập giới hạn **5 lần/phút**, JWT hết hạn sau **8 giờ**.
+- Chỉ tài khoản **Administrator** hoặc tài khoản email có `AdminLevel = 2` mới đăng nhập được. Đăng nhập giới hạn **5 lần/phút cho mỗi IP**, JWT hết hạn sau **8 giờ**.
 - Bridge dùng thông tin đăng nhập thành công **gần nhất** cho mọi yêu cầu, nên chỉ dùng trong nhóm quản trị tin cậy.
-- Giữ `Urls` ở `127.0.0.1`, đặt sau HTTPS, hạn chế IP truy cập.
+- Giữ `Urls` ở `127.0.0.1`, đặt sau HTTPS, hạn chế IP truy cập. Bridge tự thêm các header bảo mật (CSP, `X-Frame-Options`, `nosniff`, `Referrer-Policy`).
 - Bridge đọc được nội dung thư trong hàng đợi, file log và file chứng chỉ trên máy chủ. Chỉ đọc các thư do chính hMailServer liệt kê trong hàng đợi, và chỉ đọc file log đúng mẫu `hmailserver_YYYY-MM-DD.log` / `ERROR_hmailserver_...log`.
 - Các tính năng **Chẩn đoán** và **kiểm tra blacklist** gửi truy vấn DNS và kết nối cổng 25 ra ngoài từ máy chủ. Chẩn đoán chỉ chạy với tên miền đã có trong hMailServer.
 - Lỗi 500 trả về nội dung lỗi thật để dễ gỡ lỗi; API chỉ dành cho quản trị viên đã đăng nhập.
@@ -288,7 +406,7 @@ Bridge gọi COM bằng late binding. Tên thuộc tính được lấy từ tà
 | `Unexpected token '<' ... is not valid JSON` hoặc "API này chưa có trong bridge" | Giao diện mới nhưng bridge đang chạy bản cũ chưa có API đó. Thay bản bridge mới và khởi động lại |
 | `You do not have access to this property / method. Ensure that ...Authenticate()` | Bridge bản cũ, hoặc bridge vừa khởi động lại. Cập nhật bridge, đăng nhập lại |
 | Đăng nhập luôn 401 | Tên đăng nhập phải là `Administrator` (hoặc tài khoản email có quyền admin cấp server). Xem dòng `warn: Login '...' refused` trong log bridge |
-| Đăng nhập báo 429 | Quá 5 lần/phút, chờ một phút |
+| Đăng nhập báo 429 | IP của bạn đã thử quá 5 lần/phút, chờ một phút. Nếu mọi người dùng đều bị 429 khi đã công khai, kiểm tra proxy có gửi `X-Forwarded-For` không |
 | `hMailServer COM is not registered on this machine` | Bridge không chạy trên máy cài hMailServer |
 | `Access denied` / `0x80070005` khi gọi COM | Tài khoản chạy bridge chưa có quyền DCOM, xem 6.4 |
 | Cảnh báo `The WebRootPath was not found` | Chưa chép giao diện vào `wwwroot` |
